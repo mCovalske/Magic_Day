@@ -1,536 +1,438 @@
-import asyncio
-import html
-import os
+import asyncio, html, os, random
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
-
 import aiohttp
 from aiohttp import web
-
-from db import (
-    acquire_bot_lock, add_product, create_order, ensure_user, get_active_subscriptions,
-    get_all_users, get_order, get_product, get_product_by_name, get_products, get_recent_orders,
-    get_stats, get_subscription, get_user, get_user_orders, init_db, set_order_status,
-    set_product_active, set_subscription, update_product, update_user_field,
-)
+from db import *
 from personal import SPHERES, get_personal_forecast, get_sphere_forecast
 from predictions import get_random_prediction
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-PORT = int(os.getenv("PORT", "10000"))
-MOSCOW_TZ = ZoneInfo("Europe/Moscow")
-BASE_DIR = Path(__file__).resolve().parent
-STATIC_DIR = BASE_DIR / "static"
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
-if ADMIN_ID <= 0:
-    raise RuntimeError("ADMIN_ID must be set")
+BOT_TOKEN=os.getenv("BOT_TOKEN")
+ADMIN_ID=int(os.getenv("ADMIN_ID","0"))
+PORT=int(os.getenv("PORT","10000"))
+TZ=ZoneInfo("Europe/Moscow")
+BASE=Path(__file__).resolve().parent
+STATIC=BASE/"static"
+app=web.Application()
+telegram_session=None
+lock_conn=None
+lock_cur=None
+states={}
+activity={}
+last_notified={}
+BLACK_ANSWERS=["✅ ДА","❌ НЕТ","🎱 Скорее да","🎱 Скорее нет","🤔 Пока неясно","✨ Определённо да","🌙 Сейчас лучше не решать","🍀 Да, но не торопись","⚡ НЕТ — подожди","🔮 Ответ скрыт, попробуй позже"]
 
-app = web.Application()
-user_states = {}
-user_activity = {}
-last_notification_sent = {}
-telegram_session = None
-bot_lock_conn = None
-bot_lock_cursor = None
-MAX_ACTIONS_PER_MINUTE = 20
+BAD_WORDS={
+"бляд","бля","сука","хуй","хуе","пизд","еб","ёб","еба","ёба","ебл","мудак","дебил","идиот",
+"тупиц","козёл","козел","урод","мраз","гандон","пидор","педик","шлюх","проститут"
+}
 
-
-def kb(rows, one_time=False):
-    return {"keyboard": rows, "resize_keyboard": True, "one_time_keyboard": one_time, "is_persistent": False}
-
-
-def main_kb():
-    return kb([
-        [{"text": "🔮 Предсказание на день"}, {"text": "✨ Персональное"}],
-        [{"text": "🎯 По сферам"}, {"text": "💎 Каталог"}],
-        [{"text": "🔔 Уведомления"}, {"text": "👤 Личный кабинет"}],
-    ])
-
-
-def back_kb(): return kb([[{"text": "🔙 Главное меню"}]])
-def gender_kb(): return kb([[{"text": "👨 Мужчина"}, {"text": "👩 Женщина"}], [{"text": "🙂 Не хочу указывать"}], [{"text": "🔙 Главное меню"}]], True)
-def phone_kb(): return {"keyboard":[[{"text":"📱 Отправить мой номер","request_contact":True}],[{"text":"⌨️ Ввести номер вручную"}],[{"text":"❌ Отмена"}]],"resize_keyboard":True,"one_time_keyboard":True,"is_persistent":False}
-def sphere_kb(): return kb([[{"text":"❤️ Любовь"},{"text":"💼 Карьера"}],[{"text":"💰 Финансы"},{"text":"👨‍👩‍👧 Семья"}],[{"text":"🌿 Самочувствие"},{"text":"📚 Развитие"}],[{"text":"🔙 Главное меню"}]])
-def catalog_kb():
-    ps=get_products(True); rows=[]; row=[]
-    for p in ps:
-        row.append({"text":p["name"]})
-        if len(row)==2: rows.append(row); row=[]
-    if row: rows.append(row)
-    rows.append([{"text":"🔙 Главное меню"}]); return kb(rows)
+def kb(rows,one=False): return {"keyboard":rows,"resize_keyboard":True,"one_time_keyboard":one,"is_persistent":False}
+def main_kb(): return kb([[{"text":"🔮 Предсказание на день"},{"text":"✨ Персональное"}],[{"text":"🎯 По сферам"},{"text":"💎 Каталог"}],[{"text":"🔔 Уведомления"},{"text":"👤 Личный кабинет"}],[{"text":"🎱 Чёрный шар"},{"text":"🎁 Подарить"}]])
+def back_kb(): return kb([[{"text":"🔙 Главное меню"}]])
 def product_kb(): return kb([[{"text":"🛒 Заказать"}],[{"text":"🔙 К каталогу"}]])
+def catalog_kb(): 
+    ps=get_products(True); rows=[]
+    for i in range(0,len(ps),2): rows.append([{"text":p["name"]} for p in ps[i:i+2]])
+    rows.append([{"text":"🔙 Главное меню"}]); return kb(rows)
+def gender_kb(): return kb([[{"text":"👨 Мужчина"},{"text":"👩 Женщина"}],[{"text":"🙂 Не хочу указывать"}]],True)
+def sphere_kb(): return kb([[{"text":"❤️ Любовь"},{"text":"💼 Карьера"}],[{"text":"💰 Финансы"},{"text":"👨‍👩‍👧 Семья"}],[{"text":"🌿 Самочувствие"},{"text":"📚 Развитие"}],[{"text":"🔙 Главное меню"}]])
+def account_kb(): return kb([[{"text":"📅 Мой день"},{"text":"✏️ Изменить данные"}],[{"text":"📦 Мои заказы"},{"text":"⭐ Оставить отзыв"}],[{"text":"🔙 Главное меню"}]])
+def edit_kb(): return kb([[{"text":"Имя"},{"text":"Пол"}],[{"text":"Дата рождения"},{"text":"Телефон"}],[{"text":"🔙 Личный кабинет"}]])
+def phone_kb(): return {"keyboard":[[{"text":"📱 Отправить мой номер","request_contact":True}],[{"text":"⌨️ Ввести вручную"}],[{"text":"❌ Отмена"}]],"resize_keyboard":True,"one_time_keyboard":True,"is_persistent":False}
 def order_confirm_kb(): return kb([[{"text":"✅ Подтвердить заказ"}],[{"text":"❌ Отменить заказ"}]])
-def notifications_kb(active): return kb([[{"text":"🕒 Изменить время"}],[{"text":"🔕 Отписаться"}],[{"text":"🔙 Главное меню"}]]) if active else kb([[{"text":"🔔 Включить уведомления"}],[{"text":"🔙 Главное меню"}]])
-def account_kb(): return kb([[{"text":"✏️ Изменить данные"}],[{"text":"📦 Мои заказы"}],[{"text":"🔙 Главное меню"}]])
-def edit_account_kb(): return kb([[{"text":"Имя"},{"text":"Пол"}],[{"text":"Дата рождения"},{"text":"Телефон"}],[{"text":"🔙 Личный кабинет"}]])
-def time_kb():
-    times=[f"{h:02d}:00" for h in range(7,23)]
-    rows=[]
-    for i in range(0,len(times),4):
-        rows.append([{"text":t} for t in times[i:i+4]])
-    rows.append([{"text":"⌨️ Другое время"}])
-    rows.append([{"text":"❌ Отмена"}])
-    return kb(rows, True)
+def notify_kb(active): return kb([[{"text":"🕒 Изменить время"}],[{"text":"🔕 Отписаться"}],[{"text":"🔙 Главное меню"}]]) if active else kb([[{"text":"🔔 Включить уведомления"}],[{"text":"🔙 Главное меню"}]])
+def time_kb(): return kb([[{"text":t} for t in ["08:00","09:00","10:00","11:00"]],[{"text":t} for t in ["12:00","13:00","14:00","15:00"]],[{"text":t} for t in ["16:00","17:00","18:00","19:00"]],[{"text":t} for t in ["20:00","21:00","22:00","23:00"]],[{"text":"⌨️ Другое время"}],[{"text":"❌ Отмена"}]],True)
+def admin_kb(): return kb([[{"text":"📊 Статистика"},{"text":"📦 Заказы"}],[{"text":"🛍 Каталог"},{"text":"⭐ Отзывы"}],[{"text":"📣 Рассылка"},{"text":"👥 Пользователи"}],[{"text":"🚪 Выйти"}]])
+def admin_order_kb(): return kb([[{"text":"✅ Подтвердить"},{"text":"❌ Отклонить"}],[{"text":"🔙 К заказам"}]])
 
-
-def admin_kb(): return kb([[{"text":"📊 Статистика"},{"text":"📦 Заказы"}],[{"text":"🛍 Каталог"},{"text":"🔔 Уведомления"}],[{"text":"👥 Пользователи"},{"text":"📣 Рассылка"}],[{"text":"🚪 Выйти"}]])
-def admin_order_kb(): return kb([[{"text":"✅ Подтвердить"},{"text":"❌ Отклонить"}],[{"text":"🔙 К списку заказов"}]])
-def admin_product_kb(active): return kb([[{"text":"✏️ Изменить название"}],[{"text":"📝 Изменить описание"}],[{"text":"💰 Изменить цену"}],[{"text":"⏸ Скрыть товар" if active else "▶️ Показать товар"}],[{"text":"🔙 Каталог админа"}]])
-
-async def tg(method, payload=None, timeout=30):
-    if telegram_session is None: raise RuntimeError("Telegram session not ready")
-    async with telegram_session.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=payload or {}, timeout=timeout) as resp:
-        data=await resp.json(content_type=None)
-        if resp.status != 200 or not data.get("ok"): raise RuntimeError(f"Telegram {method}: {resp.status} {data}")
+async def tg(method,payload=None,timeout=30):
+    async with telegram_session.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",json=payload or {},timeout=timeout) as r:
+        data=await r.json(content_type=None)
+        if r.status!=200 or not data.get("ok"): raise RuntimeError(f"Telegram {method}: {r.status} {data}")
         return data["result"]
-
-async def send(chat_id,text,reply_markup=None,parse_mode="HTML"):
-    p={"chat_id":chat_id,"text":text}
-    if reply_markup is not None: p["reply_markup"]=reply_markup
-    if parse_mode: p["parse_mode"]=parse_mode
+async def send(cid,text,markup=None):
+    p={"chat_id":cid,"text":text,"parse_mode":"HTML"}
+    if markup is not None:p["reply_markup"]=markup
     return await tg("sendMessage",p)
+async def typing(cid): return await tg("sendChatAction",{"chat_id":cid,"action":"typing"})
 
-async def typing(chat_id): return await tg("sendChatAction",{"chat_id":chat_id,"action":"typing"})
+def clean(s): return str(s or "").strip()
+def valid_date(s):
+    try: datetime.strptime(s,"%d.%m.%Y"); return True
+    except ValueError:return False
+def valid_time(s):
+    try: datetime.strptime(s,"%H:%M"); return True
+    except ValueError:return False
+def valid_phone(s):
+    d=clean(s).replace("+","").replace(" ","").replace("-","").replace("(","").replace(")",""); return d.isdigit() and 10<=len(d)<=15
+def esc(s): return html.escape(str(s or ""))
+def status(s): return {"new":"🆕 Новый","confirmed":"✅ Подтверждён","rejected":"❌ Отклонён","completed":"📦 Завершён"}.get(s,s)
+def bad_text(s): 
+    t=clean(s).lower().replace("ё","е")
+    t=re.sub(r"[^а-яa-z0-9]+"," ",t) if 're' in globals() else t
+    return any(w in t for w in BAD_WORDS)
 
-def valid_date(v):
-    try: datetime.strptime(v,"%d.%m.%Y"); return True
-    except ValueError: return False
+# import re lazily without making message code messy
+import re
 
-def valid_time(v):
-    try: datetime.strptime(v,"%H:%M"); return True
-    except ValueError: return False
+async def ensure(cid): ensure_user(cid); return get_user(cid)
+def flood_ok(cid):
+    now=datetime.now(); a=activity.setdefault(cid,[]); a[:]=[x for x in a if now-x<timedelta(minutes=1)]
+    if len(a)>=20:return False
+    a.append(now);return True
 
-def clean_phone(v): return v.strip().replace("+","").replace(" ","").replace("-","").replace("(","").replace(")","")
-def valid_phone(v):
-    d=clean_phone(v); return 10<=len(d)<=15 and d.isdigit()
-def esc(v): return html.escape(str(v or ""))
-def flood_ok(uid):
-    now=datetime.now(); arr=user_activity.setdefault(uid,[]); arr[:]=[x for x in arr if now-x<timedelta(minutes=1)]
-    if len(arr)>=MAX_ACTIONS_PER_MINUTE: return False
-    arr.append(now); return True
+async def profile_flow(cid,sphere=None):
+    u=await ensure(cid)
+    if not u["name"]: states[cid]={"type":"name","sphere":sphere}; await send(cid,"Как вас зовут?",back_kb()); return
+    if not u["gender"]: states[cid]={"type":"gender","sphere":sphere}; await send(cid,"Укажите ваш пол:",gender_kb()); return
+    if not u["birthdate"]: states[cid]={"type":"birth","sphere":sphere}; await send(cid,"Введите дату рождения в формате ДД.ММ.ГГГГ:",back_kb()); return
+    await make_forecast(cid,u,sphere)
 
-def gender_from_text(t): return "male" if t=="👨 Мужчина" else "female" if t=="👩 Женщина" else "other"
-def status_text(s): return {"new":"🆕 Новый","confirmed":"✅ Подтверждён","rejected":"❌ Отклонён","completed":"📦 Завершён"}.get(s,s)
+async def make_forecast(cid,u,sphere=None):
+    await typing(cid); await asyncio.sleep(.4)
+    txt=get_sphere_forecast(u["birthdate"],u["gender"],u["name"],sphere) if sphere else get_personal_forecast(u["birthdate"],u["gender"],u["name"])
+    await send(cid,txt,main_kb())
 
-async def homepage(request):
-    f=STATIC_DIR/"index.html"
-    return web.FileResponse(f) if f.exists() else web.Response(text="OK")
-async def health(request): return web.json_response({"status":"ok"})
-app.router.add_get("/",homepage); app.router.add_get("/health",health); app.router.add_static("/static",path=str(STATIC_DIR),name="static")
+async def show_account(cid):
+    u=await ensure(cid); orders=user_orders(cid)
+    await send(cid,f"👤 <b>Личный кабинет</b>\n\nИмя: {esc(u['name'] or 'не указано')}\nПол: {esc({'male':'мужчина','female':'женщина','other':'не указан'}.get(u['gender'],'не указан'))}\nДата рождения: {esc(u['birthdate'] or 'не указана')}\nТелефон: {esc(u['phone'] or 'не указан')}\nЗаказов: <b>{len(orders)}</b>",account_kb())
 
-async def ensure_profile(chat_id): ensure_user(chat_id); return get_user(chat_id)
+async def my_day(cid):
+    u=await ensure(cid)
+    if not (u["name"] and u["gender"] and u["birthdate"]):
+        await profile_flow(cid); return
+    day_score=(datetime.now(TZ).day+cid)%100
+    await send(cid,f"📅 <b>Мой день</b>\n\n⚡ Энергия: <b>{50+day_score%46}%</b>\n❤️ Отношения: <b>{45+(day_score*3)%51}%</b>\n💼 Дела: <b>{50+(day_score*5)%46}%</b>\n🍀 Удача: <b>{40+(day_score*7)%61}%</b>\n\n💫 Совет: сегодня лучше выбрать одну главную задачу и довести её до результата.",main_kb())
 
-async def begin_personal(chat_id,sphere=None):
-    u=await ensure_profile(chat_id)
-    if not u["name"]: user_states[chat_id]={"type":"personal_name","sphere":sphere}; await send(chat_id,"Как вас зовут?",back_kb()); return
-    if not u["gender"]: user_states[chat_id]={"type":"personal_gender","sphere":sphere}; await send(chat_id,"Укажите ваш пол — это помогает сформировать обращение.",gender_kb()); return
-    if not u["birthdate"]: user_states[chat_id]={"type":"personal_birthdate","sphere":sphere}; await send(chat_id,"Введите дату рождения в формате ДД.ММ.ГГГГ:",back_kb()); return
-    await produce_forecast(chat_id,u,sphere)
+async def handle_state(cid,text,state,msg):
+    typ=state["type"]
 
-async def produce_forecast(chat_id,u,sphere=None):
-    await typing(chat_id); await asyncio.sleep(.4)
-    text=get_sphere_forecast(u["birthdate"],u["gender"],u["name"],sphere) if sphere else get_personal_forecast(u["birthdate"],u["gender"],u["name"])
-    await send(chat_id,text,main_kb())
-
-async def show_catalog(chat_id):
-    if not get_products(True): await send(chat_id,"Каталог временно пуст.",main_kb()); return
-    await send(chat_id,"💎 <b>Каталог</b>\n\nВыберите бусину Дзи:",catalog_kb())
-
-async def show_product(chat_id,p):
-    price=f"{p['price_rub']:,}".replace(","," ")
-    await send(chat_id,f"💎 <b>{esc(p['name'])}</b>\n\n{esc(p['description'])}\n\n💰 <b>{price} ₽</b>",product_kb())
-
-async def show_account(chat_id):
-    u=await ensure_profile(chat_id); orders=get_user_orders(chat_id)
-    g={"male":"мужчина","female":"женщина","other":"не указано"}.get(u["gender"],"не указано")
-    await send(chat_id,f"👤 <b>Личный кабинет</b>\n\nИмя: <b>{esc(u['name'] or 'не указано')}</b>\nПол: <b>{g}</b>\nДата рождения: <b>{esc(u['birthdate'] or 'не указана')}</b>\nТелефон: <b>{esc(u['phone'] or 'не указан')}</b>\nЗаказов: <b>{len(orders)}</b>",account_kb())
-
-async def show_orders(chat_id):
-    orders=get_user_orders(chat_id)
-    if not orders: await send(chat_id,"📦 У вас пока нет заказов.",account_kb()); return
-    parts=["📦 <b>Мои заказы</b>"]
-    for o in orders[:20]:
-        dt=o["created_at"].astimezone(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M")
-        parts.append(f"\n<b>Заказ №{o['id']}</b>\n💎 {esc(o['product_name'])}\n📌 {status_text(o['status'])}\n🗓 {dt}")
-    await send(chat_id,"\n".join(parts),account_kb())
-
-async def show_notifications(chat_id):
-    sub=get_subscription(chat_id)
-    if sub and sub["active"]:
-        await send(chat_id,f"🔔 <b>Уведомления включены</b>\n\nКаждый день в <b>{sub['time']}</b> по Москве я сообщу, что ваше предсказание на день готово.",notifications_kb(True))
-    else:
-        await send(chat_id,"🔔 <b>Ежедневные уведомления</b>\n\nЯ буду сообщать: «Ваше предсказание на день готово — узнайте, что вас ждёт». Выберите удобное время.",notifications_kb(False))
-
-async def admin_orders(chat_id):
-    os_=get_recent_orders(20)
-    if not os_: await send(chat_id,"Заказов пока нет.",admin_kb()); return
-    rows=[[{"text":f"Заказ №{o['id']} — {o['product_name']}"}] for o in os_]
-    rows.append([{"text":"🔙 Админ-панель"}]); await send(chat_id,"📦 <b>Заказы</b>\n\nВыберите заказ:",kb(rows))
-
-async def admin_order(chat_id,oid):
-    o=get_order(oid)
-    if not o: await send(chat_id,"Заказ не найден.",admin_kb()); return
-    dt=o["created_at"].astimezone(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M")
-    user_states[chat_id]={"type":"admin_order","order_id":oid}
-    await send(chat_id,f"📦 <b>Заказ №{oid}</b>\n\n💎 {esc(o['product_name'])}\n👤 {esc(o['customer_name'])}\n📞 {esc(o['customer_phone'])}\n🆔 {o['telegram_id']}\n📌 {status_text(o['status'])}\n🗓 {dt}",admin_order_kb())
-
-async def admin_catalog(chat_id):
-    ps=get_products(False); rows=[]
-    for p in ps: rows.append([{"text":("🟢 " if p["is_active"] else "⚪ ")+p["name"]}])
-    rows += [[{"text":"➕ Добавить товар"}],[{"text":"🔙 Админ-панель"}]]
-    await send(chat_id,"🛍 <b>Управление каталогом</b>",kb(rows))
-
-async def admin_product(chat_id,p):
-    await send(chat_id,f"💎 <b>{esc(p['name'])}</b>\n\n{esc(p['description'])}\n\nЦена: <b>{p['price_rub']:,} ₽</b>\nСтатус: {'активен' if p['is_active'] else 'скрыт'}".replace(","," "),admin_product_kb(p["is_active"]))
-
-async def handle_state(chat_id,text,state,message):
-    t=state["type"]
-    if text=="🔙 Главное меню":
-        user_states.pop(chat_id,None); await send(chat_id,"Главное меню:",main_kb()); return
-    if t=="selected_product":
-        if text=="🔙 К каталогу":
-            user_states.pop(chat_id,None); await show_catalog(chat_id); return
+    if typ=="selected_product":
         if text=="🛒 Заказать":
-            p=get_product(state["product_id"])
-            if not p or not p["is_active"]:
-                user_states.pop(chat_id,None); await send(chat_id,"Товар недоступен.",main_kb()); return
-            u=get_user(chat_id) or {}; name=u.get("name") or ""; phone=u.get("phone") or ""
-            if not name:
-                user_states[chat_id]={"type":"order_name","product_id":p["id"]}; await send(chat_id,"Как вас зовут для оформления заказа?",back_kb()); return
-            if not phone:
-                user_states[chat_id]={"type":"order_phone","product_id":p["id"],"name":name}; await send(chat_id,"Укажите номер телефона:",phone_kb()); return
-            user_states[chat_id]={"type":"order_confirm","product_id":p["id"],"name":name,"phone":phone}
-            price=f"{p['price_rub']:,}".replace(","," ")
-            await send(chat_id,f"🧾 <b>Проверьте заказ</b>\n\n💎 {esc(p['name'])}\n💰 {price} ₽\n👤 {esc(name)}\n📞 {esc(phone)}\n\nВсё верно?",order_confirm_kb()); return
-        await show_product(chat_id,get_product(state["product_id"]))
-        return
-    if t=="admin_selected_product":
-        p=get_product(state["product_id"])
-        if not p:
-            user_states.pop(chat_id,None); await send(chat_id,"Товар не найден.",admin_kb()); return
-        if text=="🔙 Каталог админа":
-            user_states.pop(chat_id,None); await admin_catalog(chat_id); return
-        if text=="✏️ Изменить название":
-            user_states[chat_id]={"type":"admin_edit_name","product_id":p["id"]}; await send(chat_id,"Введите новое название:",back_kb()); return
-        if text=="📝 Изменить описание":
-            user_states[chat_id]={"type":"admin_edit_description","product_id":p["id"]}; await send(chat_id,"Введите новое описание:",back_kb()); return
-        if text=="💰 Изменить цену":
-            user_states[chat_id]={"type":"admin_edit_price","product_id":p["id"]}; await send(chat_id,"Введите новую цену:",back_kb()); return
-        if text in {"⏸ Скрыть товар","▶️ Показать товар"}:
-            set_product_active(p["id"],not p["is_active"]); await admin_product(chat_id,get_product(p["id"])); return
-        await admin_product(chat_id,p); return
-    if text in {"❌ Отмена","/cancel"}:
-        user_states.pop(chat_id,None); await send(chat_id,"Действие отменено.",main_kb()); return
-    if t=="personal_name":
-        if not text: await send(chat_id,"Введите имя:",back_kb()); return
-        update_user_field(chat_id,"name",text[:50]); user_states[chat_id]={"type":"personal_gender","sphere":state.get("sphere")}; await send(chat_id,"Укажите ваш пол:",gender_kb()); return
-    if t=="personal_gender":
-        if text not in {"👨 Мужчина","👩 Женщина","🙂 Не хочу указывать"}: await send(chat_id,"Выберите вариант кнопкой.",gender_kb()); return
-        update_user_field(chat_id,"gender",gender_from_text(text)); user_states[chat_id]={"type":"personal_birthdate","sphere":state.get("sphere")}; await send(chat_id,"Введите дату рождения в формате ДД.ММ.ГГГГ:",back_kb()); return
-    if t=="personal_birthdate":
-        if not valid_date(text): await send(chat_id,"Неверная дата. Формат ДД.ММ.ГГГГ:",back_kb()); return
-        update_user_field(chat_id,"birthdate",text); user_states.pop(chat_id,None); await produce_forecast(chat_id,get_user(chat_id),state.get("sphere")); return
-    if t=="notification_time":
-        if text=="⌨️ Другое время": user_states[chat_id]={"type":"notification_custom_time"}; await send(chat_id,"Введите время ЧЧ:ММ, например 09:30:",back_kb()); return
-        if not valid_time(text): await send(chat_id,"Выберите время кнопкой.",time_kb()); return
-        set_subscription(chat_id,text,True); user_states.pop(chat_id,None); await send(chat_id,f"🔔 Уведомления включены. Каждый день в {text} по Москве я сообщу, что ваше предсказание готово.",main_kb()); return
-    if t=="notification_custom_time":
-        if not valid_time(text): await send(chat_id,"Неверное время. Пример: 09:30",back_kb()); return
-        set_subscription(chat_id,text,True); user_states.pop(chat_id,None); await send(chat_id,f"🔔 Уведомления включены на {text} по Москве.",main_kb()); return
-    if t=="order_name":
-        if not text: await send(chat_id,"Введите имя:",back_kb()); return
-        user_states[chat_id]={"type":"order_phone","product_id":state["product_id"],"name":text[:50]}; await send(chat_id,"Теперь укажите номер телефона для связи.",phone_kb()); return
-    if t in {"order_phone","account_edit_phone"}:
-        if text=="⌨️ Ввести номер вручную": user_states[chat_id]={"type":"order_manual_phone","product_id":state.get("product_id"),"name":state.get("name")} if t=="order_phone" else {"type":"account_manual_phone"}; await send(chat_id,"Введите номер телефона:",back_kb()); return
-        phone=message.get("contact",{}).get("phone_number","") if message.get("contact") else (text if text else "")
-        if not valid_phone(phone): await send(chat_id,"Не удалось распознать номер.",phone_kb()); return
-        if t=="account_edit_phone": update_user_field(chat_id,"phone",phone); user_states.pop(chat_id,None); await show_account(chat_id); return
-        user_states[chat_id]={"type":"order_confirm","product_id":state["product_id"],"name":state["name"],"phone":phone}; p=get_product(state["product_id"]); price=f"{p['price_rub']:,}".replace(","," "); await send(chat_id,f"🧾 <b>Проверьте заказ</b>\n\n💎 {esc(p['name'])}\n💰 {price} ₽\n👤 {esc(state['name'])}\n📞 {esc(phone)}\n\nВсё верно?",order_confirm_kb()); return
-    if t=="order_manual_phone":
-        if not valid_phone(text): await send(chat_id,"Неверный номер.",back_kb()); return
-        user_states[chat_id]={"type":"order_confirm","product_id":state["product_id"],"name":state["name"],"phone":text}; p=get_product(state["product_id"]); price=f"{p['price_rub']:,}".replace(","," "); await send(chat_id,f"🧾 <b>Проверьте заказ</b>\n\n💎 {esc(p['name'])}\n💰 {price} ₽\n👤 {esc(state['name'])}\n📞 {esc(text)}\n\nВсё верно?",order_confirm_kb()); return
-    if t=="order_confirm":
-        if text!="✅ Подтвердить заказ": user_states.pop(chat_id,None); await send(chat_id,"Заказ отменён.",main_kb()); return
-        oid=create_order(chat_id,state["product_id"],state["name"],state["phone"]); update_user_field(chat_id,"phone",state["phone"]); p=get_product(state["product_id"]); user_states.pop(chat_id,None)
-        await send(chat_id,f"🙏 <b>Спасибо за ваш заказ!</b>\n\nЗаказ №{oid} на браслет «{esc(p['name'])}» принят.\n\nЗаказ передан менеджеру, и скоро приступят к сборке браслета. Менеджер свяжется с вами для подтверждения.",main_kb())
-        await send(ADMIN_ID,f"🆕 <b>Новый заказ №{oid}</b>\n\n💎 {esc(p['name'])}\n👤 {esc(state['name'])}\n📞 {esc(state['phone'])}\n🆔 {chat_id}",admin_kb()); return
-    if t=="account_edit_name":
-        if text=="🔙 Личный кабинет": user_states.pop(chat_id,None); await show_account(chat_id); return
-        update_user_field(chat_id,"name",text[:50]); user_states.pop(chat_id,None); await show_account(chat_id); return
-    if t=="account_edit_gender":
-        if text not in {"👨 Мужчина","👩 Женщина","🙂 Не хочу указывать"}: await send(chat_id,"Выберите вариант.",gender_kb()); return
-        update_user_field(chat_id,"gender",gender_from_text(text)); user_states.pop(chat_id,None); await show_account(chat_id); return
-    if t=="account_edit_birthdate":
-        if not valid_date(text): await send(chat_id,"Формат ДД.ММ.ГГГГ",back_kb()); return
-        update_user_field(chat_id,"birthdate",text); user_states.pop(chat_id,None); await show_account(chat_id); return
-    if t=="account_manual_phone":
-        if not valid_phone(text): await send(chat_id,"Неверный номер.",back_kb()); return
-        update_user_field(chat_id,"phone",text); user_states.pop(chat_id,None); await show_account(chat_id); return
-    if t=="admin_order":
-        if text=="🔙 К списку заказов": user_states.pop(chat_id,None); await admin_orders(chat_id); return
-        o=get_order(state["order_id"])
-        if not o: user_states.pop(chat_id,None); await send(chat_id,"Заказ не найден.",admin_kb()); return
-        if text not in {"✅ Подтвердить","❌ Отклонить"}: await send(chat_id,"Выберите действие.",admin_order_kb()); return
-        status="confirmed" if text=="✅ Подтвердить" else "rejected"; set_order_status(o["id"],status); user_states.pop(chat_id,None); await send(o["telegram_id"],f"{status_text(status)} Заказ №{o['id']}.",main_kb()); await send(chat_id,f"Статус заказа №{o['id']} изменён: {status_text(status)}",admin_kb()); return
-    if t=="admin_add_name":
-        user_states[chat_id]={"type":"admin_add_desc","name":text[:100]}; await send(chat_id,"Введите описание:",back_kb()); return
-    if t=="admin_add_desc":
-        user_states[chat_id]={"type":"admin_add_price","name":state["name"],"description":text[:1000]}; await send(chat_id,"Введите цену в рублях:",back_kb()); return
-    if t=="admin_add_price":
-        try: price=int(text.replace(" ","")); assert 0<=price<=10000000
-        except Exception: await send(chat_id,"Введите целую цену от 0 до 10 000 000.",back_kb()); return
-        add_product(state["name"],state["description"],price); user_states.pop(chat_id,None); await send(chat_id,"✅ Товар добавлен.",admin_kb()); return
-    if t.startswith("admin_edit_"):
-        field=t.replace("admin_edit_","")
-        value=text
-        if field=="price":
-            try: value=int(text.replace(" ","")); assert 0<=value<=10000000
-            except Exception: await send(chat_id,"Введите корректную цену.",back_kb()); return
-        update_product(state["product_id"],{"name":"name","description":"description","price":"price_rub"}[field],value); user_states.pop(chat_id,None); await admin_catalog(chat_id); return
-    if t=="admin_broadcast":
-        if chat_id!=ADMIN_ID: user_states.pop(chat_id,None); return
-        if text=="/cancel": user_states.pop(chat_id,None); await send(chat_id,"Рассылка отменена.",admin_kb()); return
-        users=get_all_users(10000); sent_count=0
-        for u in users:
-            try: await send(u["telegram_id"],text,main_kb()); sent_count+=1; await asyncio.sleep(.04)
-            except Exception: pass
-        user_states.pop(chat_id,None); await send(chat_id,f"📣 Рассылка завершена. Отправлено: {sent_count}.",admin_kb()); return
-
-async def process_update(update):
-    if "message" not in update: return
-    m=update["message"]; chat_id=int(m["chat"]["id"]); text=(m.get("text") or "").strip()
-    if not flood_ok(chat_id): return
-    ensure_user(chat_id)
-    state=user_states.get(chat_id)
-    if state:
-        await handle_state(chat_id,text,state,m); return
-    if text=="/start": await send(chat_id,"🔮 <b>Добро пожаловать!</b>\n\nВыберите действие:",main_kb()); return
-    if text=="/admin" and chat_id==ADMIN_ID: await send(chat_id,"👑 <b>Админ-панель</b>",admin_kb()); return
-    if text in {"🔙 Главное меню","🔙 Главнoe меню"}: await send(chat_id,"Главное меню:",main_kb()); return
-    if text=="🔮 Предсказание на день": await send(chat_id,get_random_prediction(),main_kb()); return
-    if text=="✨ Персональное": await begin_personal(chat_id); return
-    if text=="🎯 По сферам": await send(chat_id,"Выберите сферу:",sphere_kb()); return
-    sm={"❤️ Любовь":"love","💼 Карьера":"career","💰 Финансы":"finance","👨‍👩‍👧 Семья":"family","🌿 Самочувствие":"health","📚 Развитие":"growth"}
-    if text in sm: await begin_personal(chat_id,sm[text]); return
-    if text=="💎 Каталог": await show_catalog(chat_id); return
-    if text=="🔙 К каталогу": await show_catalog(chat_id); return
-    product=get_product_by_name(text)
-    if product:
-        if not product["is_active"]: await send(chat_id,"Товар скрыт.",main_kb()); return
-        user_states[chat_id]={"type":"selected_product","product_id":product["id"]}; await show_product(chat_id,product); return
-    if text=="🛒 Заказать":
-        state=user_states.get(chat_id)
-        if not state or state.get("type")!="selected_product": await show_catalog(chat_id); return
-        p=get_product(state["product_id"])
-        if not p or not p["is_active"]: user_states.pop(chat_id,None); await send(chat_id,"Товар недоступен.",main_kb()); return
-        u=get_user(chat_id); name=u["name"] if u else ""; phone=u["phone"] if u else ""
-        if not name: user_states[chat_id]={"type":"order_name","product_id":p["id"]}; await send(chat_id,"Как вас зовут для оформления заказа?",back_kb()); return
-        if not phone: user_states[chat_id]={"type":"order_phone","product_id":p["id"],"name":name}; await send(chat_id,"Укажите номер телефона:",phone_kb()); return
-        user_states[chat_id]={"type":"order_confirm","product_id":p["id"],"name":name,"phone":phone}; price=f"{p['price_rub']:,}".replace(","," "); await send(chat_id,f"🧾 <b>Проверьте заказ</b>\n\n💎 {esc(p['name'])}\n💰 {price} ₽\n👤 {esc(name)}\n📞 {esc(phone)}\n\nВсё верно?",order_confirm_kb()); return
-    if text=="🔔 Уведомления": await show_notifications(chat_id); return
-    if text in {"🔔 Включить уведомления","🕒 Изменить время"}: user_states[chat_id]={"type":"notification_time"}; await send(chat_id,"Выберите время:",time_kb()); return
-    if text=="🔕 Отписаться": set_subscription(chat_id,"00:00",False); await send(chat_id,"🔕 Уведомления отключены.",main_kb()); return
-    if text=="👤 Личный кабинет": await show_account(chat_id); return
-    if text=="✏️ Изменить данные": await send(chat_id,"Что изменить?",edit_account_kb()); return
-    if text=="Имя": user_states[chat_id]={"type":"account_edit_name"}; await send(chat_id,"Введите новое имя:",back_kb()); return
-    if text=="Пол": user_states[chat_id]={"type":"account_edit_gender"}; await send(chat_id,"Выберите пол:",gender_kb()); return
-    if text=="Дата рождения": user_states[chat_id]={"type":"account_edit_birthdate"}; await send(chat_id,"Введите новую дату:",back_kb()); return
-    if text=="Телефон": user_states[chat_id]={"type":"account_edit_phone"}; await send(chat_id,"Выберите способ указать номер:",phone_kb()); return
-    if text=="🔙 Личный кабинет": await show_account(chat_id); return
-    if text=="📦 Мои заказы": await show_orders(chat_id); return
-    if chat_id==ADMIN_ID:
-        if text=="📊 Статистика":
-            s=get_stats(); await send(chat_id,f"📊 <b>Статистика</b>\n\nПользователей: {s['users']}\nУведомлений: {s['subscriptions']}\nТоваров: {s['products']}\nЗаказов: {s['orders']}\nНовых: {s['new_orders']}\nПодтверждённых: {s['confirmed']}\nОтклонённых: {s['rejected']}",admin_kb()); return
-        if text=="📦 Заказы": await admin_orders(chat_id); return
-        if text.startswith("Заказ №"):
-            try: await admin_order(chat_id,int(text.split("№",1)[1].split(" ",1)[0]))
-            except Exception: await send(chat_id,"Некорректный номер заказа.",admin_kb())
+            product=get_product(state["pid"])
+            if not product or not product["is_active"]:
+                states.pop(cid,None)
+                await send(cid,"Этот товар больше недоступен.",main_kb())
+                return
+            u=get_user(cid)
+            if not u["name"]:
+                states[cid]={"type":"order_name","pid":product["id"]}
+                await send(cid,"Как вас зовут для оформления заказа?",back_kb())
+                return
+            if not u["phone"]:
+                states[cid]={"type":"order_phone","pid":product["id"],"name":u["name"]}
+                await send(cid,"Теперь укажите номер телефона.",phone_kb())
+                return
+            states[cid]={"type":"order_confirm","pid":product["id"],"name":u["name"],"phone":u["phone"]}
+            await send(
+                cid,
+                f"🧾 <b>Проверьте заказ</b>\n\n"
+                f"💎 {esc(product['name'])}\n"
+                f"💰 {product['price_rub']:,} ₽\n"
+                f"👤 {esc(u['name'])}\n"
+                f"📞 {esc(u['phone'])}\n\n"
+                f"Всё верно?",
+                order_confirm_kb(),
+            )
             return
-        if text=="🔙 К списку заказов": await admin_orders(chat_id); return
-        if text=="🛍 Каталог": await admin_catalog(chat_id); return
-        if text=="➕ Добавить товар": user_states[chat_id]={"type":"admin_add_name"}; await send(chat_id,"Введите название товара:",back_kb()); return
-        if text=="🔙 Каталог админа": await admin_catalog(chat_id); return
-        for p in get_products(False):
-            if text in {"🟢 "+p["name"],"⚪ "+p["name"]}: user_states[chat_id]={"type":"admin_selected_product","product_id":p["id"]}; await admin_product(chat_id,p); return
-        if text=="✏️ Изменить название": return
-        if text=="📝 Изменить описание": return
-        if text=="💰 Изменить цену": return
-        if text in {"⏸ Скрыть товар","▶️ Показать товар"}: return
-        if text=="🔙 Админ-панель": await send(chat_id,"👑 <b>Админ-панель</b>",admin_kb()); return
-        if text=="👥 Пользователи":
-            us=get_all_users(30); await send(chat_id,"\n".join(["👥 <b>Пользователи</b>"]+[f"🆔 {u['telegram_id']} — {esc(u['name'] or 'без имени')}" for u in us]) if us else "Пользователей пока нет.",admin_kb()); return
-        if text=="🔔 Уведомления": await send(chat_id,f"🔔 Активных уведомлений: <b>{len(get_active_subscriptions())}</b>",admin_kb()); return
-        if text=="📣 Рассылка": user_states[chat_id]={"type":"admin_broadcast"}; await send(chat_id,"Введите текст рассылки. Для отмены /cancel",back_kb()); return
-        if text=="🚪 Выйти": await send(chat_id,"Вы вышли из админ-панели.",main_kb()); return
-    await send(chat_id,"Используйте кнопки меню.",main_kb())
+        if text=="🔙 К каталогу":
+            states.pop(cid,None)
+            await send(cid,"💎 <b>Каталог Дзи</b>\n\nВыберите бусину:",catalog_kb())
+            return
+        states.pop(cid,None)
+        await send(cid,"Используйте кнопки товара.",product_kb())
+        return
+
+    if text in {"❌ Отмена","/cancel"} or text=="🔙 Главное меню":
+        states.pop(cid,None); await send(cid,"Действие отменено.",main_kb()); return
+    if bad_text(text) and typ not in {"order_confirm"}:
+        await send(cid,"Пожалуйста, используйте нейтральные слова.",back_kb()); return
+    if len(text)>1000:
+        await send(cid,"Сообщение слишком длинное.",back_kb()); return
+    if typ=="name":
+        update_user(cid,"name",text[:50]); states[cid]={"type":"gender","sphere":state.get("sphere")}; await send(cid,"Укажите ваш пол:",gender_kb()); return
+    if typ=="gender":
+        mp={"👨 Мужчина":"male","👩 Женщина":"female","🙂 Не хочу указывать":"other"}
+        if text not in mp: await send(cid,"Выберите вариант кнопкой.",gender_kb()); return
+        update_user(cid,"gender",mp[text]); states[cid]={"type":"birth","sphere":state.get("sphere")}; await send(cid,"Введите дату рождения в формате ДД.ММ.ГГГГ:",back_kb()); return
+    if typ=="birth":
+        if not valid_date(text): await send(cid,"Неверная дата. Формат ДД.ММ.ГГГГ:",back_kb()); return
+        update_user(cid,"birthdate",text); states.pop(cid,None); await make_forecast(cid,get_user(cid),state.get("sphere")); return
+    if typ=="notify":
+        if text=="⌨️ Другое время": states[cid]={"type":"notify_custom"}; await send(cid,"Введите время ЧЧ:ММ:",back_kb()); return
+        if not valid_time(text): await send(cid,"Выберите время:",time_kb()); return
+        set_subscription(cid,text,True); states.pop(cid,None); await send(cid,f"🔔 Уведомления включены. Каждый день в {text} по Москве.",main_kb()); return
+    if typ=="notify_custom":
+        if not valid_time(text): await send(cid,"Неверное время:",back_kb()); return
+        set_subscription(cid,text,True); states.pop(cid,None); await send(cid,f"🔔 Уведомления будут приходить каждый день в {text}.",main_kb()); return
+    if typ=="order_name":
+        states[cid]={"type":"order_phone","pid":state["pid"],"name":text[:50]}; await send(cid,"Теперь укажите номер телефона.",phone_kb()); return
+    if typ=="order_phone":
+        if text=="⌨️ Ввести вручную": states[cid]={"type":"order_manual","pid":state["pid"],"name":state["name"]}; await send(cid,"Введите номер телефона:",back_kb()); return
+        phone=msg.get("contact",{}).get("phone_number","") if msg.get("contact") else text
+        if not valid_phone(phone): await send(cid,"Неверный номер. Используйте контакт или введите номер вручную.",phone_kb()); return
+        states[cid]={"type":"order_confirm","pid":state["pid"],"name":state["name"],"phone":phone}; p=get_product(state["pid"])
+        await send(cid,f"🧾 <b>Проверьте заказ</b>\n\n💎 {esc(p['name'])}\n💰 {p['price_rub']:,} ₽\n👤 {esc(state['name'])}\n📞 {esc(phone)}\n\nПодтвердить?",order_confirm_kb()); return
+    if typ=="order_manual":
+        if not valid_phone(text): await send(cid,"Неверный номер.",back_kb()); return
+        states[cid]={"type":"order_confirm","pid":state["pid"],"name":state["name"],"phone":text}; p=get_product(state["pid"])
+        await send(cid,f"🧾 <b>Проверьте заказ</b>\n\n💎 {esc(p['name'])}\n💰 {p['price_rub']:,} ₽\n👤 {esc(state['name'])}\n📞 {esc(text)}\n\nПодтвердить?",order_confirm_kb()); return
+    if typ=="order_confirm":
+        if text!="✅ Подтвердить заказ": states.pop(cid,None); await send(cid,"Заказ отменён.",main_kb()); return
+        oid=create_order(cid,state["pid"],state["name"],state["phone"]); update_user(cid,"name",state["name"]); update_user(cid,"phone",state["phone"]); p=get_product(state["pid"]); states.pop(cid,None)
+        await send(cid,f"🙏 <b>Спасибо за ваш заказ!</b>\n\nЗаказ №{oid} на «{esc(p['name'])}» принят.\n\nЗаказ передан менеджеру, и скоро приступят к сборке браслета. Менеджер свяжется с вами.",main_kb())
+        await send(ADMIN_ID,f"🆕 <b>Новый заказ №{oid}</b>\n\n💎 {esc(p['name'])}\n👤 {esc(state['name'])}\n📞 {esc(state['phone'])}\n🆔 {cid}",admin_kb()); return
+    if typ=="ball_question":
+        count=ball_state(cid)
+        if count>=3: states.pop(cid,None); await send(cid,"🎱 На сегодня три вопроса уже использованы. Возвращайтесь завтра.",main_kb()); return
+        increment_ball(cid); states.pop(cid,None); await send(cid,f"🎱 <b>Чёрный шар отвечает:</b>\n\n{random.choice(BLACK_ANSWERS)}",main_kb()); return
+    if typ=="review_pick":
+        try: oid=int(text.split("№",1)[1].split(" ",1)[0])
+        except: await send(cid,"Выберите заказ кнопкой.",main_kb()); return
+        states[cid]={"type":"review_rating","oid":oid}; await send(cid,"Поставьте оценку от 1 до 5:",kb([[{"text":"⭐ 1"},{"text":"⭐ 2"},{"text":"⭐ 3"},{"text":"⭐ 4"},{"text":"⭐ 5"}],[{"text":"❌ Отмена"}]],True)); return
+    if typ=="review_rating":
+        m=re.search(r"([1-5])",text)
+        if not m: await send(cid,"Выберите оценку 1–5.",back_kb()); return
+        states[cid]={"type":"review_text","oid":state["oid"],"rating":int(m.group(1))}; await send(cid,"Напишите отзыв или нажмите /skip:",back_kb()); return
+    if typ=="review_text":
+        add_review(cid,state["oid"],state["rating"],"" if text=="/skip" else text); states.pop(cid,None); await send(cid,"⭐ Спасибо за отзыв!",main_kb()); return
+    if typ=="edit_name": update_user(cid,"name",text[:50]); states.pop(cid,None); await show_account(cid); return
+    if typ=="edit_gender":
+        mp={"👨 Мужчина":"male","👩 Женщина":"female","🙂 Не хочу указывать":"other"}
+        if text in mp: update_user(cid,"gender",mp[text]); states.pop(cid,None); await show_account(cid)
+        else: await send(cid,"Выберите вариант.",gender_kb())
+        return
+    if typ=="edit_birth":
+        if valid_date(text): update_user(cid,"birthdate",text); states.pop(cid,None); await show_account(cid)
+        else: await send(cid,"Неверная дата.",back_kb())
+        return
+    if typ=="edit_phone":
+        if text=="⌨️ Ввести вручную": states[cid]={"type":"edit_manual_phone"}; await send(cid,"Введите номер:",back_kb()); return
+        phone=msg.get("contact",{}).get("phone_number","") if msg.get("contact") else text
+        if valid_phone(phone): update_user(cid,"phone",phone); states.pop(cid,None); await show_account(cid)
+        else: await send(cid,"Неверный номер.",phone_kb())
+        return
+    if typ=="edit_manual_phone":
+        if valid_phone(text): update_user(cid,"phone",text); states.pop(cid,None); await show_account(cid)
+        else: await send(cid,"Неверный номер.",back_kb())
+        return
+    if typ=="admin_order":
+        if text=="🔙 К заказам": states.pop(cid,None); await admin_orders(cid); return
+        if text not in {"✅ Подтвердить","❌ Отклонить"}: await send(cid,"Выберите действие.",admin_order_kb()); return
+        oid=state["oid"]; st="confirmed" if text=="✅ Подтвердить" else "rejected"; set_order_status(oid,st); o=get_order(oid); states.pop(cid,None)
+        await send(o["telegram_id"],f"{'✅ Заказ подтверждён.' if st=='confirmed' else '❌ Заказ отклонён.'}\n\nСтатус заказа №{oid}: {status(st)}",main_kb()); await send(cid,f"Статус заказа №{oid} изменён.",admin_kb()); return
+    if typ=="admin_edit":
+        update_product(state["pid"],state["field"],text.strip()[:1000]); states.pop(cid,None); await admin_product(cid,get_product(state["pid"])); return
+    if typ=="admin_add":
+        step=state["step"]
+        if step==1: states[cid]={"type":"admin_add","step":2,"name":text[:100],"desc":""}; await send(cid,"Введите описание:",back_kb()); return
+        if step==2: state["desc"]=text[:1000]; state["step"]=3; states[cid]=state; await send(cid,"Введите цену:",back_kb()); return
+        try: price=int(text.replace(" ","").replace(",",""))
+        except: await send(cid,"Цена должна быть числом.",back_kb()); return
+        add_product(state["name"],state["desc"],price); states.pop(cid,None); await send(cid,"✅ Товар добавлен.",admin_kb()); return
+    if typ=="admin_product":
+        p=get_product(state["pid"])
+        if text=="🗑 Удалить товар":
+            if delete_product(p["id"]): states.pop(cid,None); await send(cid,"🗑 Товар удалён.",admin_kb())
+            else: await send(cid,"У товара уже есть заказы. Его можно только скрыть.",admin_kb())
+            return
+        if text=="⏸ Скрыть товар" or text=="▶️ Показать товар":
+            set_product_active(p["id"],not p["is_active"]); await admin_product(cid,get_product(p["id"])); return
+        if text in {"✏️ Название","📝 Описание","💰 Цена"}:
+            field={"✏️ Название":"name","📝 Описание":"description","💰 Цена":"price_rub"}[text]
+            states[cid]={"type":"admin_edit","pid":p["id"],"field":field}; await send(cid,"Введите новое значение:",back_kb()); return
+        await admin_product(cid,p); return
+    if typ=="admin_broadcast":
+        users=get_all_users(10000); ok=bad=0
+        for u in users:
+            try: await send(u["telegram_id"],text,main_kb()); ok+=1
+            except: bad+=1
+            await asyncio.sleep(.04)
+        states.pop(cid,None); await send(cid,f"📣 Рассылка завершена. Отправлено: {ok}, ошибок: {bad}.",admin_kb()); return
+
+async def admin_orders(cid):
+    os_=recent_orders(20)
+    rows=[]
+    for o in os_: rows.append([{"text":f"Заказ №{o['id']} — {o['product_name']}"}])
+    rows.append([{"text":"🔙 Админ-панель"}])
+    await send(cid,"📦 <b>Заказы</b>\n\nВыберите заказ:",kb(rows))
+
+async def admin_product(cid,p):
+    toggle="⏸ Скрыть товар" if p["is_active"] else "▶️ Показать товар"
+    await send(cid,f"💎 <b>{esc(p['name'])}</b>\n\n{esc(p['description'])}\n\nЦена: <b>{p['price_rub']} ₽</b>",kb([[{"text":"✏️ Название"}],[{"text":"📝 Описание"}],[{"text":"💰 Цена"}],[{"text":toggle}],[{"text":"🗑 Удалить товар"}],[{"text":"🔙 Каталог"}]]))
+
+async def process(update):
+    if "message" not in update:return
+    m=update["message"]; cid=int(m["chat"]["id"]); text=clean(m.get("text"))
+    if not flood_ok(cid): await send(cid,"Слишком много сообщений. Подождите минуту."); return
+    ensure_user(cid)
+    if bad_text(text): await send(cid,"Пожалуйста, используйте нейтральные слова.",main_kb()); return
+    state=states.get(cid)
+    if state: await handle_state(cid,text,state,m); return
+    if text=="/start": await send(cid,"🔮 <b>Добро пожаловать!</b>\n\nВыберите функцию:",main_kb()); return
+    if text=="🔙 Главное меню": await send(cid,"Главное меню:",main_kb()); return
+    if text=="🔮 Предсказание на день": await send(cid,get_random_prediction(),main_kb()); return
+    if text=="✨ Персональное": await profile_flow(cid); return
+    if text=="🎯 По сферам": await send(cid,"Выберите сферу:",sphere_kb()); return
+    sm={"❤️ Любовь":"love","💼 Карьера":"career","💰 Финансы":"finance","👨‍👩‍👧 Семья":"family","🌿 Самочувствие":"health","📚 Развитие":"growth"}
+    if text in sm: await profile_flow(cid,sm[text]); return
+    if text=="💎 Каталог": await send(cid,"💎 <b>Каталог Дзи</b>\n\nВыберите бусину:",catalog_kb()); return
+    if text=="🔙 К каталогу": await send(cid,"💎 <b>Каталог Дзи</b>\n\nВыберите бусину:",catalog_kb()); return
+    p=get_product_by_name(text)
+    if p and p["is_active"]: states[cid]={"type":"selected_product","pid":p["id"]}; await send(cid,f"💎 <b>{esc(p['name'])}</b>\n\n{esc(p['description'])}\n\n💰 <b>{p['price_rub']} ₽</b>",product_kb()); return
+    if text=="🛒 Заказать":
+        st=states.get(cid)
+        if not st or st["type"]!="selected_product": await send(cid,"Сначала выберите товар.",catalog_kb()); return
+        p=get_product(st["pid"]); u=get_user(cid)
+        if not u["name"]: states[cid]={"type":"order_name","pid":p["id"]}; await send(cid,"Как вас зовут?",back_kb()); return
+        if not u["phone"]: states[cid]={"type":"order_phone","pid":p["id"],"name":u["name"]}; await send(cid,"Укажите номер телефона:",phone_kb()); return
+        states[cid]={"type":"order_confirm","pid":p["id"],"name":u["name"],"phone":u["phone"]}; await send(cid,f"Заказ на <b>{esc(p['name'])}</b> за {p['price_rub']} ₽.\n\nПодтвердить?",order_confirm_kb()); return
+    if text=="🔔 Уведомления":
+        sub=get_subscription(cid); await send(cid, f"🔔 <b>Уведомления</b>\n\n"+(f"Включены. Время: {sub['time']} по Москве." if sub and sub["active"] else "Уведомления выключены.\nЯ могу каждый день сообщать, что ваше предсказание на день готово."),notify_kb(bool(sub and sub["active"]))); return
+    if text in {"🔔 Включить уведомления","🕒 Изменить время"}: states[cid]={"type":"notify"}; await send(cid,"Выберите время:",time_kb()); return
+    if text=="🔕 Отписаться": set_subscription(cid,"00:00",False); await send(cid,"🔕 Уведомления отключены.",main_kb()); return
+    if text=="👤 Личный кабинет": await show_account(cid); return
+    if text=="📅 Мой день": await my_day(cid); return
+    if text=="✏️ Изменить данные": await send(cid,"Что изменить?",edit_kb()); return
+    if text=="🔙 Личный кабинет": await show_account(cid); return
+    if text=="Имя": states[cid]={"type":"edit_name"}; await send(cid,"Введите новое имя:",back_kb()); return
+    if text=="Пол": states[cid]={"type":"edit_gender"}; await send(cid,"Выберите пол:",gender_kb()); return
+    if text=="Дата рождения": states[cid]={"type":"edit_birth"}; await send(cid,"Введите дату:",back_kb()); return
+    if text=="Телефон": states[cid]={"type":"edit_phone"}; await send(cid,"Укажите телефон:",phone_kb()); return
+    if text=="📦 Мои заказы":
+        os_=user_orders(cid)
+        if not os_: await send(cid,"📦 Заказов пока нет.",account_kb()); return
+        s=["📦 <b>Мои заказы</b>"]+[f"№{o['id']} · {esc(o['product_name'])} · {status(o['status'])}" for o in os_]
+        await send(cid,"\n".join(s),account_kb()); return
+    if text=="⭐ Оставить отзыв":
+        r=get_reviewable_orders(cid)
+        if not r: await send(cid,"Пока нет завершённых заказов, для которых можно оставить отзыв.",account_kb()); return
+        rows=[[{"text":f"Заказ №{x['id']} — {x['product_name']}"}] for x in r]
+        rows.append([{"text":"🔙 Личный кабинет"}]); states[cid]={"type":"review_pick"}; await send(cid,"Выберите заказ:",kb(rows)); return
+    if text=="🎱 Чёрный шар":
+        if ball_state(cid)>=3: await send(cid,"🎱 Сегодня вы уже задали 3 вопроса. Возвращайтесь завтра.",main_kb()); return
+        states[cid]={"type":"ball_question"}; await send(cid,f"🎱 <b>Чёрный шар</b>\n\nЗадайте вопрос, на который можно ответить ДА или НЕТ.\nСегодня доступно: {3-ball_state(cid)} вопрос(а).",back_kb()); return
+    if text=="🎁 Подарить":
+        await send(cid,"🎁 <b>Подарок</b>\n\nВыберите, что хотите отправить другу:",kb([[{"text":"🔮 Подарить предсказание"}],[{"text":"💎 Подарить браслет"}],[{"text":"🔙 Главное меню"}]])); return
+    if text=="🔮 Подарить предсказание":
+        await send(cid,"🎁 Предложение для друга:\n\n"+get_random_prediction()+"\n\nМожете переслать это сообщение другу.",main_kb()); return
+    if text=="💎 Подарить браслет":
+        await send(cid,"🎁 <b>Идея для подарка</b>\n\nВыберите браслет в каталоге и оформите заказ. После создания заказа можно переслать другу название и описание понравившейся бусины.",main_kb()); return
+
+    if cid==ADMIN_ID:
+        if text=="/admin": await send(cid,"👑 <b>Админ-панель</b>",admin_kb()); return
+        if text=="📦 Заказы": await admin_orders(cid); return
+        if text.startswith("Заказ №"):
+            oid=int(text.split("№",1)[1].split(" ",1)[0]); o=get_order(oid)
+            if o: states[cid]={"type":"admin_order","oid":oid}; await send(cid,f"📦 <b>Заказ №{oid}</b>\n\n💎 {esc(o['product_name'])}\n👤 {esc(o['customer_name'])}\n📞 {esc(o['customer_phone'])}\n📌 {status(o['status'])}",admin_order_kb())
+            return
+        if text=="✅ Подтвердить" or text=="❌ Отклонить": await send(cid,"Сначала выберите заказ.",admin_kb()); return
+        if text=="🔙 К заказам": await admin_orders(cid); return
+        if text=="🛍 Каталог":
+            ps=get_products(False); rows=[[{"text":("🟢 " if p["is_active"] else "⚪ ")+p["name"]}] for p in ps]+[[{"text":"➕ Добавить товар"}],[{"text":"🔙 Админ-панель"}]]
+            await send(cid,"🛍 <b>Каталог</b>",kb(rows)); return
+        if text.startswith("🟢 ") or text.startswith("⚪ "):
+            name=text[2:]; p=get_product_by_name(name)
+            if p: states[cid]={"type":"admin_product","pid":p["id"]}; await admin_product(cid,p)
+            return
+        if text=="➕ Добавить товар": states[cid]={"type":"admin_add","step":1,"name":"","desc":""}; await send(cid,"Введите название товара:",back_kb()); return
+        if text=="⭐ Отзывы":
+            rs=get_reviews(20)
+            if not rs: await send(cid,"Отзывов пока нет.",admin_kb()); return
+            txt=["⭐ <b>Последние отзывы</b>"]+[f"\nЗаказ №{r['order_id']} · {r['rating']}/5\n{esc(r['text'])}" for r in rs]
+            await send(cid,"\n".join(txt),admin_kb()); return
+        if text=="📊 Статистика":
+            await send(cid,"📊 Статистика доступна в текущей версии в базовом виде через раздел заказов и отзывов. Расширенный дашборд пока не добавлен.",admin_kb()); return
+        if text=="👥 Пользователи": await send(cid,f"👥 Пользователей: {len(get_all_users(10000))}",admin_kb()); return
+        if text=="📣 Рассылка": states[cid]={"type":"admin_broadcast"}; await send(cid,"Введите текст рассылки:",back_kb()); return
+        if text=="🚪 Выйти": await send(cid,"Вы вышли из админ-панели.",main_kb()); return
+
+    await send(cid,"Используйте кнопки меню.",main_kb())
 
 async def polling():
-    offset=0
+    off=0
     await tg("deleteWebhook",{"drop_pending_updates":False})
-    print("BOT POLLING STARTED")
+    print("Telegram polling is running.")
     while True:
         try:
-            updates=await tg("getUpdates",{"offset":offset,"timeout":50,"allowed_updates":["message"]},timeout=65)
-            for u in updates:
-                offset=u["update_id"]+1
-                try: await process_update(u)
-                except Exception as exc: print(f"UPDATE ERROR: {exc}")
+            for u in await tg("getUpdates",{"offset":off,"timeout":50,"allowed_updates":["message"]},65):
+                off=u["update_id"]+1
+                try: await process(u)
+                except Exception as exc: print("Update error:",exc)
         except asyncio.CancelledError: raise
-        except Exception as exc: print(f"POLLING ERROR: {exc}"); await asyncio.sleep(3)
+        except Exception as exc: print("Polling error:",exc); await asyncio.sleep(4)
 
 async def scheduler():
     while True:
         try:
-            now=datetime.now(MOSCOW_TZ); hhmm=now.strftime("%H:%M"); day=now.strftime("%Y-%m-%d")
-            for sub in get_active_subscriptions(hhmm):
-                key=(sub["telegram_id"],day,hhmm)
-                if last_notification_sent.get(sub["telegram_id"])==key: continue
+            now=datetime.now(TZ); hhmm=now.strftime("%H:%M"); keyday=now.strftime("%Y-%m-%d")
+            for uid in due_subscriptions(hhmm):
+                key=(uid,keyday,hhmm)
+                if last_notified.get(uid)==key: continue
                 try:
-                    await send(sub["telegram_id"],"🔔 <b>Ваше предсказание на день готово</b>\n\nУзнайте, что вас ждёт.\n\n"+get_random_prediction(),main_kb())
-                    last_notification_sent[sub["telegram_id"]]=key
-                except Exception as exc: print(f"NOTIFICATION ERROR: {exc}")
+                    await send(uid,"🔔 <b>Ваше предсказание на день готово</b>\n\nУзнайте, что вас ждёт.\n\n"+get_random_prediction(),main_kb())
+                    last_notified[uid]=key
+                except Exception as exc: print("Notify error:",uid,exc)
         except asyncio.CancelledError: raise
-        except Exception as exc: print(f"SCHEDULER ERROR: {exc}")
+        except Exception as exc: print("Scheduler error:",exc)
         await asyncio.sleep(20)
 
-async def bot_leader(app_):
-    global bot_lock_conn, bot_lock_cursor
-
-    # Render performs zero-downtime deploys: old and new instances can
-    # briefly run at the same time. The PostgreSQL advisory lock is therefore
-    # acquired AFTER the HTTP server has started, not during aiohttp startup.
+async def leader(app_):
+    global lock_conn,lock_cur
     while True:
         try:
-            bot_lock_conn, bot_lock_cursor = acquire_bot_lock()
-            print("PostgreSQL bot lock acquired. Telegram leader started.")
-
-            app_["polling"] = asyncio.create_task(polling())
-            app_["scheduler"] = asyncio.create_task(scheduler())
-
-            done, pending = await asyncio.wait(
-                {app_["polling"], app_["scheduler"]},
-                return_when=asyncio.FIRST_EXCEPTION,
-            )
-
-            for task in pending:
-                task.cancel()
-
-            for task in pending:
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-            for task in done:
-                exc = task.exception()
-                if exc:
-                    raise exc
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            print(f"Bot leader error: {exc}")
-
+            lock_conn,lock_cur=acquire_bot_lock()
+            print("Telegram leader lock acquired.")
+            app_["polling"]=asyncio.create_task(polling())
+            app_["scheduler"]=asyncio.create_task(scheduler())
+            await asyncio.gather(app_["polling"],app_["scheduler"])
+        except asyncio.CancelledError: raise
+        except Exception as exc: print("Leader waiting:",exc)
         finally:
-            for key in ("polling", "scheduler"):
-                task = app_.get(key)
-                if task:
-                    task.cancel()
-
-            for key in ("polling", "scheduler"):
-                task = app_.get(key)
-                if task:
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception as exc:
-                        print(f"Background task cleanup error: {exc}")
-
-            if bot_lock_cursor:
-                try:
-                    bot_lock_cursor.close()
-                except Exception:
-                    pass
-                bot_lock_cursor = None
-
-            if bot_lock_conn:
-                try:
-                    bot_lock_conn.close()
-                except Exception:
-                    pass
-                bot_lock_conn = None
-
-            app_.pop("polling", None)
-            app_.pop("scheduler", None)
-
-        print("Telegram leader lock unavailable. Retrying in 5 seconds...")
+            if lock_cur:
+                try: lock_cur.close()
+                except: pass
+                lock_cur=None
+            if lock_conn:
+                try: lock_conn.close()
+                except: pass
+                lock_conn=None
         await asyncio.sleep(5)
-
 
 async def startup(app_):
     global telegram_session
-
-    # Initialize the database and HTTP/Telegram client immediately.
-    # Leader election happens in the background so Render can mark the
-    # new instance healthy and then stop the old instance.
     init_db()
-    telegram_session = aiohttp.ClientSession()
-    app_["leader"] = asyncio.create_task(bot_leader(app_))
-
+    telegram_session=aiohttp.ClientSession()
+    app_["leader"]=asyncio.create_task(leader(app_))
 
 async def cleanup(app_):
-    global telegram_session, bot_lock_conn, bot_lock_cursor
+    if app_.get("leader"): app_["leader"].cancel()
+    if app_.get("leader"):
+        try: await app_["leader"]
+        except asyncio.CancelledError: pass
+        except Exception: pass
+    if telegram_session: await telegram_session.close()
 
-    leader = app_.get("leader")
-    if leader:
-        leader.cancel()
-        try:
-            await leader
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            print(f"Leader cleanup error: {exc}")
+async def api_personal(request):
+    from personal import get_personal_forecast, get_sphere_forecast
+    birth = request.query.get("birthdate","").strip()
+    sphere = request.query.get("sphere","general").strip()
+    if not valid_date(birth):
+        return web.json_response({"message":"Укажите дату в формате ДД.ММ.ГГГГ"},status=400)
+    try:
+        # Web version has no stored gender/name; use neutral demo values.
+        text = get_personal_forecast(birth,"other","Друг") if sphere=="general" else get_sphere_forecast(birth,"other","Друг",sphere)
+        return web.json_response({"prediction":text})
+    except Exception as exc:
+        return web.json_response({"message":"Не удалось сформировать прогноз"},status=500)
 
-    for key in ("polling", "scheduler"):
-        task = app_.get(key)
-        if task:
-            task.cancel()
+app.router.add_get("/health",lambda r:web.json_response({"status":"ok"}))
+app.router.add_get("/api/personal",api_personal)
+app.router.add_static("/static",path=str(STATIC),name="static")
+app.router.add_get("/",lambda r:web.FileResponse(STATIC/"index.html"))
+app.on_startup.append(startup); app.on_cleanup.append(cleanup)
 
-    for key in ("polling", "scheduler"):
-        task = app_.get(key)
-        if task:
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:
-                print(f"Task cleanup error: {exc}")
-
-    if telegram_session:
-        await telegram_session.close()
-        telegram_session = None
-
-    if bot_lock_cursor:
-        try:
-            bot_lock_cursor.close()
-        except Exception:
-            pass
-        bot_lock_cursor = None
-
-    if bot_lock_conn:
-        try:
-            bot_lock_conn.close()
-        except Exception:
-            pass
-        bot_lock_conn = None
-
-
-app.on_startup.append(startup)
-app.on_cleanup.append(cleanup)
-
-if __name__ == "__main__":
-    web.run_app(app, host="0.0.0.0", port=PORT)
+if __name__=="__main__":
+    web.run_app(app,host="0.0.0.0",port=PORT)
