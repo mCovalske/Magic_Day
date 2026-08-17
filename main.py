@@ -1,3 +1,4 @@
+# BUILD: PREDBOT-2026-08-17-LOCKFIX-02
 import asyncio
 import html
 import os
@@ -485,26 +486,136 @@ async def scheduler():
         except Exception as exc: print(f"SCHEDULER ERROR: {exc}")
         await asyncio.sleep(20)
 
+async def bot_leader(app_):
+    global bot_lock_conn, bot_lock_cursor
+
+    while True:
+        try:
+            bot_lock_conn, bot_lock_cursor = acquire_bot_lock()
+            print("POSTGRES LOCK ACQUIRED")
+
+            app_["polling"] = asyncio.create_task(polling())
+            app_["scheduler"] = asyncio.create_task(scheduler())
+
+            done, pending = await asyncio.wait(
+                {app_["polling"], app_["scheduler"]},
+                return_when=asyncio.FIRST_EXCEPTION,
+            )
+
+            for task in pending:
+                task.cancel()
+
+            for task in pending:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+            for task in done:
+                exc = task.exception()
+                if exc:
+                    raise exc
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as exc:
+            print(f"LEADER ERROR: {exc}")
+
+        finally:
+            for key in ("polling", "scheduler"):
+                task = app_.get(key)
+                if task:
+                    task.cancel()
+
+            for key in ("polling", "scheduler"):
+                task = app_.get(key)
+                if task:
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as exc:
+                        print(f"TASK CLEANUP ERROR: {exc}")
+
+            app_.pop("polling", None)
+            app_.pop("scheduler", None)
+
+            if bot_lock_cursor:
+                try:
+                    bot_lock_cursor.close()
+                except Exception:
+                    pass
+                bot_lock_cursor = None
+
+            if bot_lock_conn:
+                try:
+                    bot_lock_conn.close()
+                except Exception:
+                    pass
+                bot_lock_conn = None
+
+        print("POSTGRES LOCK UNAVAILABLE; RETRYING IN 5 SECONDS")
+        await asyncio.sleep(5)
+
+
 async def startup(app_):
-    global telegram_session,bot_lock_conn,bot_lock_cursor
+    global telegram_session
+
+    # Do not acquire the advisory lock during aiohttp startup.
+    # Render may run old and new instances together during deployment.
     init_db()
-telegram_session = aiohttp.ClientSession()
-app_["leader"] = asyncio.create_task(bot_leader(app_))
-    app_["polling"]=asyncio.create_task(polling()); app_["scheduler"]=asyncio.create_task(scheduler())
+    telegram_session = aiohttp.ClientSession()
+    app_["leader"] = asyncio.create_task(bot_leader(app_))
+
 
 async def cleanup(app_):
-    global telegram_session,bot_lock_conn,bot_lock_cursor
-    for k in ("polling","scheduler"):
-        t=app_.get(k)
-        if t: t.cancel()
-    for k in ("polling","scheduler"):
-        t=app_.get(k)
-        if t:
-            try: await t
-            except asyncio.CancelledError: pass
-    if telegram_session: await telegram_session.close(); telegram_session=None
-    if bot_lock_cursor: bot_lock_cursor.close(); bot_lock_cursor=None
-    if bot_lock_conn: bot_lock_conn.close(); bot_lock_conn=None
+    global telegram_session, bot_lock_conn, bot_lock_cursor
 
-app.on_startup.append(startup); app.on_cleanup.append(cleanup)
+    leader = app_.get("leader")
+    if leader:
+        leader.cancel()
+        try:
+            await leader
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            print(f"LEADER CLEANUP ERROR: {exc}")
+
+    for key in ("polling", "scheduler"):
+        task = app_.get(key)
+        if task:
+            task.cancel()
+
+    for key in ("polling", "scheduler"):
+        task = app_.get(key)
+        if task:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                print(f"TASK CLEANUP ERROR: {exc}")
+
+    if telegram_session:
+        await telegram_session.close()
+        telegram_session = None
+
+    if bot_lock_cursor:
+        try:
+            bot_lock_cursor.close()
+        except Exception:
+            pass
+        bot_lock_cursor = None
+
+    if bot_lock_conn:
+        try:
+            bot_lock_conn.close()
+        except Exception:
+            pass
+        bot_lock_conn = None
+
+
+app.on_startup.append(startup)
+app.on_cleanup.append(cleanup)
 if __name__=="__main__": web.run_app(app,host="0.0.0.0",port=PORT)
