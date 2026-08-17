@@ -487,7 +487,9 @@ async def scheduler():
 
 async def startup(app_):
     global telegram_session,bot_lock_conn,bot_lock_cursor
-    init_db(); bot_lock_conn,bot_lock_cursor=acquire_bot_lock(); telegram_session=aiohttp.ClientSession()
+    init_db()
+telegram_session = aiohttp.ClientSession()
+app_["leader"] = asyncio.create_task(bot_leader(app_))
     app_["polling"]=asyncio.create_task(polling()); app_["scheduler"]=asyncio.create_task(scheduler())
 
 async def cleanup(app_):
