@@ -1,4 +1,4 @@
-# BUILD: PREDBOT-2026-08-18-LEGAL-FIX-03
+# BUILD: PREDBOT-2026-08-18-LEGAL-WEBAPP-01
 import asyncio
 import html
 import os
@@ -67,13 +67,22 @@ def consent_kb():
 
 def back_kb(): return kb([[{"text": "🔙 Главное меню"}]])
 def legal_kb():
-    return kb([
-        [{"text": "🔐 Политика ПДн"}, {"text": "✅ Согласие ПДн"}],
-        [{"text": "🛡 Конфиденциальность"}, {"text": "📜 Пользовательское соглашение"}],
-        [{"text": "🛒 Публичная оферта"}, {"text": "⚠️ Дисклеймер"}],
-        [{"text": "📣 Рекламное согласие"}, {"text": "📩 Права субъекта ПДн"}],
-        [{"text": "🔙 Главное меню"}],
-    ])
+    base = PUBLIC_URL
+    return {
+        "keyboard": [
+            [{"text": "🔐 Политика ПДн", "web_app": {"url": f"{base}/legal/01_policy_personal_data.html"}}],
+            [{"text": "✅ Согласие ПДн", "web_app": {"url": f"{base}/legal/02_consent_personal_data.html"}}],
+            [{"text": "🛡 Конфиденциальность", "web_app": {"url": f"{base}/legal/03_confidentiality_security.html"}}],
+            [{"text": "📜 Пользовательское соглашение", "web_app": {"url": f"{base}/legal/04_user_agreement.html"}}],
+            [{"text": "🛒 Публичная оферта", "web_app": {"url": f"{base}/legal/05_public_offer.html"}}],
+            [{"text": "⚠️ Дисклеймер", "web_app": {"url": f"{base}/legal/06_disclaimer_predictions.html"}}],
+            [{"text": "📣 Рекламное согласие", "web_app": {"url": f"{base}/legal/07_marketing_consent.html"}}],
+            [{"text": "📩 Права субъекта ПДн", "web_app": {"url": f"{base}/legal/08_data_subject_requests.html"}}],
+            [{"text": "🔙 Главное меню"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": False,
+    }
 
 
 def gender_kb(): return kb([[{"text": "👨 Мужчина"}, {"text": "👩 Женщина"}], [{"text": "🙂 Не хочу указывать"}], [{"text": "🔙 Главное меню"}]], True)
@@ -225,27 +234,19 @@ async def show_legal_documents(chat_id):
     if not PUBLIC_URL:
         await send(
             chat_id,
-            "📄 <b>Правовые документы</b>\n\n"
-            "Ссылки временно недоступны: администратору необходимо настроить переменную PUBLIC_URL в Render.",
+            "📄 Юридические документы временно недоступны. Администратору необходимо настроить PUBLIC_URL в Render.",
             main_kb(),
         )
         return
 
-    links = [
-        (f'<a href="{esc(legal_url("01_policy_personal_data.html"))}">Политика обработки персональных данных</a>'),
-        (f'<a href="{esc(legal_url("02_consent_personal_data.html"))}">Согласие на обработку персональных данных</a>'),
-        (f'<a href="{esc(legal_url("03_confidentiality_security.html"))}">Политика конфиденциальности и защиты информации</a>'),
-        (f'<a href="{esc(legal_url("04_user_agreement.html"))}">Пользовательское соглашение</a>'),
-        (f'<a href="{esc(legal_url("05_public_offer.html"))}">Публичная оферта</a>'),
-        (f'<a href="{esc(legal_url("06_disclaimer_predictions.html"))}">Дисклеймер прогнозов</a>'),
-        (f'<a href="{esc(legal_url("07_marketing_consent.html"))}">Согласие на рекламные сообщения</a>'),
-        (f'<a href="{esc(legal_url("08_data_subject_requests.html"))}">Порядок реализации прав субъекта ПДн</a>'),
-    ]
     await send(
         chat_id,
-        "📄 <b>Правовые документы</b>\n\n" + "\n\n".join(links),
+        "📄 <b>Правовые документы</b>\n\n"
+        "Выберите документ на клавиатуре ниже. "
+        "Документ откроется прямо в Telegram.",
         legal_kb(),
     )
+
 
 async def ensure_profile(chat_id): ensure_user(chat_id); return get_user(chat_id)
 
@@ -595,31 +596,6 @@ async def process_update(update):
         if not phone: user_states[chat_id]={"type":"order_phone","product_id":p["id"],"name":name}; await send(chat_id,"Укажите номер телефона:",phone_kb()); return
         user_states[chat_id]={"type":"order_confirm","product_id":p["id"],"name":name,"phone":phone}; price=f"{p['price_rub']:,}".replace(","," "); await send(chat_id,f"🧾 <b>Проверьте заказ</b>\n\n💎 {esc(p['name'])}\n💰 {price} ₽\n👤 {esc(name)}\n📞 {esc(phone)}\n\nВсё верно?",order_confirm_kb()); return
     if text == "📄 Правовые документы":
-        await show_legal_documents(chat_id)
-        return
-
-    if text == "🔐 Политика ПДн":
-        await show_legal_documents(chat_id)
-        return
-    if text == "✅ Согласие ПДн":
-        await show_legal_documents(chat_id)
-        return
-    if text == "🛡 Конфиденциальность":
-        await show_legal_documents(chat_id)
-        return
-    if text == "📜 Пользовательское соглашение":
-        await show_legal_documents(chat_id)
-        return
-    if text == "🛒 Публичная оферта":
-        await show_legal_documents(chat_id)
-        return
-    if text == "⚠️ Дисклеймер":
-        await show_legal_documents(chat_id)
-        return
-    if text == "📣 Рекламное согласие":
-        await show_legal_documents(chat_id)
-        return
-    if text == "📩 Права субъекта ПДн":
         await show_legal_documents(chat_id)
         return
 
