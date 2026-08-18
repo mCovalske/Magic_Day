@@ -1,4 +1,4 @@
-# BUILD: PREDBOT-2026-08-18-FULL-CHECK-03
+# BUILD: PREDBOT-2026-08-18-GIFT-NOTIFY-01
 import os
 from typing import Optional
 import psycopg2
@@ -44,6 +44,7 @@ def init_db():
                     gender_enc TEXT NOT NULL DEFAULT '',
                     birthdate_enc TEXT NOT NULL DEFAULT '',
                     phone_enc TEXT,
+                    username_enc TEXT,
                     consent_given BOOLEAN NOT NULL DEFAULT FALSE,
                     consent_version TEXT,
                     consent_at TIMESTAMPTZ,
@@ -59,6 +60,9 @@ def init_db():
             """)
             cur.execute("""
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS consent_at TIMESTAMPTZ
+            """)
+            cur.execute("""
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS username_enc TEXT
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS products (
@@ -170,7 +174,7 @@ def get_user(telegram_id: int):
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT name_enc, gender_enc, birthdate_enc, phone_enc,
-                       consent_given, consent_version, consent_at, created_at
+                       username_enc, consent_given, consent_version, consent_at, created_at
                 FROM users WHERE telegram_id = %s
             """, (telegram_id,))
             row = cur.fetchone()
@@ -184,11 +188,40 @@ def get_user(telegram_id: int):
         "gender": decrypt(row[1]),
         "birthdate": decrypt(row[2]),
         "phone": decrypt(row[3]) if row[3] else "",
-        "consent_given": bool(row[4]),
-        "consent_version": row[5] or "",
-        "consent_at": row[6],
-        "created_at": row[7],
+        "username": decrypt(row[4]) if row[4] else "",
+        "consent_given": bool(row[5]),
+        "consent_version": row[6] or "",
+        "consent_at": row[7],
+        "created_at": row[8],
     }
+
+
+def update_username(telegram_id: int, username: str):
+    username = (username or "").strip().lstrip("@").lower()
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET username_enc = %s, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = %s", (encrypt(username), telegram_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_user_by_username(username: str):
+    username = (username or "").strip().lstrip("@").lower()
+    if not username:
+        return None
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT telegram_id, username_enc FROM users WHERE username_enc IS NOT NULL")
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    for telegram_id, username_enc in rows:
+        if decrypt(username_enc).lower() == username:
+            return get_user(telegram_id)
+    return None
 
 
 def update_user_field(telegram_id: int, field: str, value: str):
