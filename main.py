@@ -1,4 +1,4 @@
-# BUILD: PREDBOT-2026-08-18-FULL-CHECK-03
+# BUILD: PREDBOT-2026-08-18-GIFT-NOTIFY-01
 import asyncio
 import html
 import os
@@ -14,6 +14,7 @@ from db import (
     add_review, consume_magic8_question, delete_product, delete_user_data, give_consent, get_magic8_remaining, get_recent_reviews,
     acquire_bot_lock, add_product, create_order, ensure_user, get_active_subscriptions,
     get_all_users, get_order, get_product, get_product_by_name, get_products, get_recent_orders,
+    get_user_by_username, update_username,
     get_stats, get_subscription, get_user, get_user_orders, init_db, set_order_status,
     set_product_active, set_subscription, update_product, update_user_field,
 )
@@ -117,10 +118,28 @@ async def send_photo(chat_id, filename, caption=None):
     return True
 
 async def ai_processing(chat_id, kind="daily"):
-    await send_photo(chat_id,"ai_processing.png")
-    steps={"daily":["🔮 Анализирую энергетику сегодняшнего дня...","✨ Сопоставляю тенденции...","📚 Формирую прогноз..."],"personal":["🔮 Анализирую ваши данные...","✨ Формирую персональный профиль...","📚 Собираю прогноз на сегодня..."],"sphere":["🔮 Анализирую дату рождения...","✨ Сопоставляю выбранную сферу...","📚 Формирую персональный ответ..."]}[kind]
+    steps = {
+        "daily": [
+            "🔮 Анализирую энергетику сегодняшнего дня...",
+            "✨ Сопоставляю ключевые тенденции...",
+            "📚 Формирую прогноз...",
+        ],
+        "personal": [
+            "🔮 Анализирую ваши данные...",
+            "✨ Формирую персональный профиль...",
+            "📚 Собираю прогноз на сегодня...",
+        ],
+        "sphere": [
+            "🔮 Анализирую дату рождения...",
+            "✨ Сопоставляю выбранную сферу...",
+            "📚 Формирую персональный ответ...",
+        ],
+    }[kind]
     for step in steps:
-        await typing(chat_id); await send(chat_id,step); await asyncio.sleep(.65)
+        await typing(chat_id)
+        await send(chat_id, step)
+        await asyncio.sleep(0.65)
+
 
 async def welcome(chat_id):
     await send_photo(chat_id,"welcome.png")
@@ -345,6 +364,25 @@ async def handle_state(chat_id, text, state, message):
     if t=="notification_custom_time":
         if not valid_time(text): await send(chat_id,"Неверное время. Пример: 09:30",back_kb()); return
         set_subscription(chat_id,text,True); user_states.pop(chat_id,None); await send(chat_id,f"🔔 Уведомления включены на {text} по Москве.",main_kb()); return
+    if t=="gift_prediction_username":
+        username = text.strip()
+        if not username.startswith("@") or len(username) < 2 or len(username) > 33:
+            await send(chat_id, "Неверный формат. Введите логин в формате <b>@username</b>.", back_kb())
+            return
+        recipient = get_user_by_username(username)
+        if not recipient:
+            user_states.pop(chat_id, None)
+            await send(chat_id, "Я не нашёл этого пользователя среди тех, кто уже запускал нашего бота. Telegram не позволяет боту первым написать человеку, который ещё не взаимодействовал с ним.\n\nПопросите получателя открыть бота и нажать /start, затем повторите отправку.", main_kb())
+            return
+        if recipient["telegram_id"] == chat_id:
+            await send(chat_id, "Нельзя отправить подарок самому себе. Укажите другой @username.", back_kb())
+            return
+        user_states.pop(chat_id, None)
+        await ai_processing(chat_id, "daily")
+        prediction = get_random_prediction()
+        await send(recipient["telegram_id"], "🎁 <b>Вам подарили предсказание!</b>\n\n" + prediction, main_kb())
+        await send(chat_id, f"✅ Предсказание отправлено пользователю <b>{esc(username)}</b>.", main_kb())
+        return
     if t=="order_name":
         if not text: await send(chat_id,"Введите имя:",back_kb()); return
         user_states[chat_id]={"type":"order_phone","product_id":state["product_id"],"name":text[:50]}; await send(chat_id,"Теперь укажите номер телефона для связи.",phone_kb()); return
@@ -434,7 +472,16 @@ async def show_magic8(chat_id):
 
 async def process_update(update):
     if "message" not in update: return
-    m=update["message"]; chat_id=int(m["chat"]["id"]); text=(m.get("text") or "").strip()
+    m=update["message"]
+    chat_id=int(m["chat"]["id"])
+    text=(m.get("text") or "").strip()
+    sender=m.get("from") or {}
+    sender_username=(sender.get("username") or "").strip().lstrip("@").lower()
+    if sender_username:
+        try:
+            update_username(chat_id, sender_username)
+        except Exception as exc:
+            print(f"USERNAME UPDATE ERROR: {exc}")
     if len(text) > 1000:
         await send(chat_id,"Сообщение слишком длинное.",main_kb()); return
     if chat_id != ADMIN_ID and text and is_bad(text):
@@ -486,8 +533,10 @@ async def process_update(update):
         user_states[chat_id]={"type":"magic8_question"}; await send(chat_id,"Сформулируйте вопрос, на который возможен ответ «Да» или «Нет».",back_kb()); return
     if text=="🎁 Подарок другу":
         await send(chat_id,"🎁 <b>Подарок другу</b>\n\nВыберите подарок:",kb([[{"text":"🔮 Подарить предсказание"}],[{"text":"💎 Подарить браслет"}],[{"text":"🔙 Главное меню"}]])); return
-    if text=="🔮 Подарить предсказание":
-        await ai_processing(chat_id,"daily"); await send(chat_id,"🎁 <b>Предсказание для друга</b>\n\n"+get_random_prediction()+"\n\nПерешлите это сообщение другу.",main_kb()); return
+    if text == "🔮 Подарить предсказание":
+        user_states[chat_id] = {"type": "gift_prediction_username"}
+        await send(chat_id, "🎁 <b>Подарить предсказание</b>\n\nВведите Telegram-логин получателя в формате <b>@username</b>.", back_kb())
+        return
     if text=="💎 Подарить браслет": await show_catalog(chat_id); return
     if text=="🔙 К каталогу": await show_catalog(chat_id); return
     product=get_product_by_name(text)
@@ -592,7 +641,11 @@ async def scheduler():
                 key=(sub["telegram_id"],day,hhmm)
                 if last_notification_sent.get(sub["telegram_id"])==key: continue
                 try:
-                    await send(sub["telegram_id"],"🔔 <b>Ваше предсказание на день готово</b>\n\nУзнайте, что вас ждёт.\n\n"+get_random_prediction(),main_kb())
+                    await send(
+                        sub["telegram_id"],
+                        "🔔 <b>Ваше предсказание на день готово!</b>\n\n✨ Загляните в чат-бот и узнайте, что вас ждёт сегодня.",
+                        main_kb(),
+                    )
                     last_notification_sent[sub["telegram_id"]]=key
                 except Exception as exc: print(f"NOTIFICATION ERROR: {exc}")
         except asyncio.CancelledError: raise
