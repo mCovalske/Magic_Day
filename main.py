@@ -1,4 +1,4 @@
-# BUILD: PREDBOT-2026-08-18-LEGAL-PACK-02
+# BUILD: PREDBOT-2026-08-18-LEGAL-FIX-03
 import asyncio
 import html
 import os
@@ -131,10 +131,27 @@ async def send_photo(chat_id, filename, caption=None):
     return True
 
 async def ai_processing(chat_id, kind="daily"):
-    await send_photo(chat_id,"ai_processing.png")
-    steps={"daily":["🔮 Анализирую энергетику сегодняшнего дня...","✨ Сопоставляю тенденции...","📚 Формирую прогноз..."],"personal":["🔮 Анализирую ваши данные...","✨ Формирую персональный профиль...","📚 Собираю прогноз на сегодня..."],"sphere":["🔮 Анализирую дату рождения...","✨ Сопоставляю выбранную сферу...","📚 Формирую персональный ответ..."]}[kind]
+    steps = {
+        "daily": [
+            "🔮 Анализирую энергетику сегодняшнего дня...",
+            "✨ Сопоставляю ключевые тенденции...",
+            "📚 Формирую прогноз...",
+        ],
+        "personal": [
+            "🔮 Анализирую ваши данные...",
+            "✨ Формирую персональный профиль...",
+            "📚 Собираю прогноз на сегодня...",
+        ],
+        "sphere": [
+            "🔮 Анализирую дату рождения...",
+            "✨ Сопоставляю выбранную сферу...",
+            "📚 Формирую персональный ответ...",
+        ],
+    }[kind]
     for step in steps:
-        await typing(chat_id); await send(chat_id,step); await asyncio.sleep(.65)
+        await typing(chat_id)
+        await send(chat_id, step)
+        await asyncio.sleep(0.65)
 
 async def welcome(chat_id):
     await send_photo(chat_id, "welcome.png")
