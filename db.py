@@ -1,3 +1,4 @@
+# BUILD: PREDBOT-2026-08-18-FULL-CHECK-03
 import os
 from typing import Optional
 import psycopg2
@@ -115,17 +116,24 @@ def init_db():
 
 def seed_products(cur):
     products = [
-        ("Дзи 9 глаз", "Символ удачи, защиты и внутренней силы.", 5000, 1),
-        ("Дзи 3 глаза", "Символ благополучия, энергии и движения вперёд.", 4500, 2),
-        ("Дзи 2 глаза", "Символ гармонии и партнёрства.", 4000, 3),
-        ("Дзи 1 глаз", "Символ ясности, концентрации и уверенного выбора.", 3500, 4),
+        ("Дзи 9 глаз", "Символ удачи, защиты и внутренней силы.", 5000, "dzi_9.png", 1),
+        ("Дзи 3 глаза", "Символ благополучия, энергии и движения вперёд.", 4500, "dzi_3.png", 2),
+        ("Дзи 2 глаза", "Символ гармонии и партнёрства.", 4000, "dzi_2.png", 3),
+        ("Дзи 1 глаз", "Символ ясности, концентрации и уверенного выбора.", 3500, "dzi_1.png", 4),
+        ("Дзи 6 глаз", "Символ спокойствия, мудрости и внутреннего равновесия.", 4300, "dzi_6.png", 5),
+        ("Дзи 12 глаз", "Символ интуиции, процветания и новых возможностей.", 5200, "dzi_12.png", 6),
     ]
-    for name, description, price, sort_order in products:
+    for name, description, price, image_file, sort_order in products:
         cur.execute("""
-            INSERT INTO products (name, description, price_rub, sort_order)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (name) DO NOTHING
-        """, (name, description, price, sort_order))
+            INSERT INTO products (name, description, price_rub, image_file, sort_order)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (name) DO UPDATE SET
+                description = EXCLUDED.description,
+                price_rub = EXCLUDED.price_rub,
+                image_file = EXCLUDED.image_file,
+                sort_order = EXCLUDED.sort_order,
+                updated_at = CURRENT_TIMESTAMP
+        """, (name, description, price, image_file, sort_order))
 
 
 def ensure_user(telegram_id: int):
@@ -161,7 +169,8 @@ def get_user(telegram_id: int):
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT name_enc, gender_enc, birthdate_enc, phone_enc, created_at
+                SELECT name_enc, gender_enc, birthdate_enc, phone_enc,
+                       consent_given, consent_version, consent_at, created_at
                 FROM users WHERE telegram_id = %s
             """, (telegram_id,))
             row = cur.fetchone()
@@ -175,7 +184,10 @@ def get_user(telegram_id: int):
         "gender": decrypt(row[1]),
         "birthdate": decrypt(row[2]),
         "phone": decrypt(row[3]) if row[3] else "",
-        "created_at": row[4],
+        "consent_given": bool(row[4]),
+        "consent_version": row[5] or "",
+        "consent_at": row[6],
+        "created_at": row[7],
     }
 
 
@@ -210,7 +222,7 @@ def get_products(active_only=True):
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            sql = "SELECT id, name, description, price_rub, is_active, sort_order FROM products"
+            sql = "SELECT id, name, description, price_rub, image_file, is_active, sort_order FROM products"
             if active_only:
                 sql += " WHERE is_active = TRUE"
             sql += " ORDER BY sort_order, id"
@@ -225,7 +237,7 @@ def get_product(product_id: int):
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, name, description, price_rub, is_active, sort_order FROM products WHERE id = %s", (product_id,))
+            cur.execute("SELECT id, name, description, price_rub, image_file, is_active, sort_order FROM products WHERE id = %s", (product_id,))
             r = cur.fetchone()
     finally:
         conn.close()
@@ -236,7 +248,7 @@ def get_product_by_name(name: str):
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, name, description, price_rub, is_active, sort_order FROM products WHERE name = %s", (name,))
+            cur.execute("SELECT id, name, description, price_rub, image_file, is_active, sort_order FROM products WHERE name = %s", (name,))
             r = cur.fetchone()
     finally:
         conn.close()
@@ -275,6 +287,24 @@ def set_product_active(product_id: int, active: bool):
         with conn.cursor() as cur:
             cur.execute("UPDATE products SET is_active = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s", (active, product_id))
         conn.commit()
+    finally:
+        conn.close()
+
+
+
+def delete_product(product_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM orders WHERE product_id = %s", (product_id,))
+            order_count = cur.fetchone()[0]
+            if order_count:
+                return False, order_count
+
+            cur.execute("DELETE FROM products WHERE id = %s", (product_id,))
+            deleted = cur.rowcount > 0
+        conn.commit()
+        return deleted, 0
     finally:
         conn.close()
 
