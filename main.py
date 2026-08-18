@@ -1,4 +1,4 @@
-# BUILD: PREDBOT-2026-08-18-STARTFIX-01
+# BUILD: PREDBOT-2026-08-18-FULL-CHECK-03
 import asyncio
 import html
 import os
@@ -11,7 +11,7 @@ import aiohttp
 from aiohttp import web
 
 from db import (
-    add_review, consume_magic8_question, delete_user_data, give_consent, get_magic8_remaining, get_recent_reviews,
+    add_review, consume_magic8_question, delete_product, delete_user_data, give_consent, get_magic8_remaining, get_recent_reviews,
     acquire_bot_lock, add_product, create_order, ensure_user, get_active_subscriptions,
     get_all_users, get_order, get_product, get_product_by_name, get_products, get_recent_orders,
     get_stats, get_subscription, get_user, get_user_orders, init_db, set_order_status,
@@ -87,9 +87,9 @@ def time_kb():
     return kb(rows, True)
 
 
-def admin_kb(): return kb([[{"text":"📊 Статистика"},{"text":"📦 Заказы"}],[{"text":"🛍 Каталог"},{"text":"🔔 Уведомления"}],[{"text":"👥 Пользователи"},{"text":"📣 Рассылка"}],[{"text":"🚪 Выйти"}]])
-def admin_order_kb(): return kb([[{"text":"✅ Подтвердить"},{"text":"❌ Отклонить"}],[{"text":"🔙 К списку заказов"}]])
-def admin_product_kb(active): return kb([[{"text":"✏️ Изменить название"}],[{"text":"📝 Изменить описание"}],[{"text":"💰 Изменить цену"}],[{"text":"⏸ Скрыть товар" if active else "▶️ Показать товар"}],[{"text":"🔙 Каталог админа"}]])
+def admin_kb(): return kb([[{"text":"📊 Статистика"},{"text":"📦 Заказы"}],[{"text":"🛍 Каталог"},{"text":"🔔 Уведомления"}],[{"text":"⭐ Отзывы"},{"text":"👥 Пользователи"}],[{"text":"📣 Рассылка"},{"text":"🚪 Выйти"}]])
+def admin_order_kb(): return kb([[{"text":"✅ Подтвердить"},{"text":"❌ Отклонить"}],[{"text":"📦 Завершить"}],[{"text":"🔙 К списку заказов"}]])
+def admin_product_kb(active): return kb([[{"text":"✏️ Изменить название"}],[{"text":"📝 Изменить описание"}],[{"text":"💰 Изменить цену"}],[{"text":"⏸ Скрыть товар" if active else "▶️ Показать товар"}],[{"text":"🗑 Удалить товар"}],[{"text":"🔙 Каталог админа"}]])
 
 async def tg(method, payload=None, timeout=30):
     if telegram_session is None: raise RuntimeError("Telegram session not ready")
@@ -145,13 +145,25 @@ def flood_ok(uid):
     if len(arr)>=MAX_ACTIONS_PER_MINUTE: return False
     arr.append(now); return True
 
+BAD_WORD_PATTERNS = [
+    r"\bбля(?:д|т)\w*\b", r"\bсука\w*\b", r"\bхуй\w*\b",
+    r"\bпизд\w*\b", r"\bеб(?:а|о|и|л|н)\w*\b", r"\bмудак\w*\b",
+    r"\bдолбо[её]б\w*\b", r"\bидиот\w*\b", r"\bдебил\w*\b",
+]
+BAD_WORD_REGEX = [re.compile(p, re.IGNORECASE) for p in BAD_WORD_PATTERNS]
+
+def is_bad(text):
+    normalized = (text or "").lower().replace("ё", "е")
+    normalized = re.sub(r"[^a-zа-я0-9]+", " ", normalized)
+    return any(rx.search(normalized) for rx in BAD_WORD_REGEX)
+
 def gender_from_text(t): return "male" if t=="👨 Мужчина" else "female" if t=="👩 Женщина" else "other"
 def status_text(s): return {"new":"🆕 Новый","confirmed":"✅ Подтверждён","rejected":"❌ Отклонён","completed":"📦 Завершён"}.get(s,s)
 
 async def homepage(request):
     f=STATIC_DIR/"index.html"
     return web.FileResponse(f) if f.exists() else web.Response(text="OK")
-async def health(request): return web.json_response({"status":"ok"})
+async def health(request): return web.json_response({"status":"ok","build":"PREDBOT-2026-08-18-FULL-CHECK-02"})
 app.router.add_get("/",homepage); app.router.add_get("/health",health); app.router.add_static("/static",path=str(STATIC_DIR),name="static")
 
 async def ensure_profile(chat_id): ensure_user(chat_id); return get_user(chat_id)
@@ -183,13 +195,30 @@ async def show_account(chat_id):
     await send(chat_id,f"👤 <b>Личный кабинет</b>\n\nИмя: <b>{esc(u['name'] or 'не указано')}</b>\nПол: <b>{g}</b>\nДата рождения: <b>{esc(u['birthdate'] or 'не указана')}</b>\nТелефон: <b>{esc(u['phone'] or 'не указан')}</b>\nЗаказов: <b>{len(orders)}</b>",account_kb())
 
 async def show_orders(chat_id):
-    orders=get_user_orders(chat_id)
-    if not orders: await send(chat_id,"📦 У вас пока нет заказов.",account_kb()); return
-    parts=["📦 <b>Мои заказы</b>"]
+    orders = get_user_orders(chat_id)
+    if not orders:
+        await send(chat_id, "📦 У вас пока нет заказов.", account_kb())
+        return
+
+    parts = ["📦 <b>Мои заказы</b>"]
+    review_rows = []
+
     for o in orders[:20]:
-        dt=o["created_at"].astimezone(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M")
-        parts.append(f"\n<b>Заказ №{o['id']}</b>\n💎 {esc(o['product_name'])}\n📌 {status_text(o['status'])}\n🗓 {dt}")
-    await send(chat_id,"\n".join(parts),account_kb())
+        dt = o["created_at"].astimezone(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M")
+        parts.append(
+            f"\n<b>Заказ №{o['id']}</b>\n"
+            f"💎 {esc(o['product_name'])}\n"
+            f"📌 {status_text(o['status'])}\n"
+            f"🗓 {dt}"
+        )
+        if o["status"] == "completed":
+            review_rows.append([{"text": f"⭐ Заказ №{o['id']} — оставить отзыв"}])
+
+    if review_rows:
+        review_rows.append([{"text": "🔙 Личный кабинет"}])
+        await send(chat_id, "\n".join(parts), kb(review_rows))
+    else:
+        await send(chat_id, "\n".join(parts), account_kb())
 
 async def show_notifications(chat_id):
     sub=get_subscription(chat_id)
@@ -220,10 +249,19 @@ async def admin_catalog(chat_id):
 async def admin_product(chat_id,p):
     await send(chat_id,f"💎 <b>{esc(p['name'])}</b>\n\n{esc(p['description'])}\n\nЦена: <b>{p['price_rub']:,} ₽</b>\nСтатус: {'активен' if p['is_active'] else 'скрыт'}".replace(","," "),admin_product_kb(p["is_active"]))
 
-async def handle_state(chat_id,text,state,message):
-    t=state["type"]
-    if text=="🔙 Главное меню":
-        user_states.pop(chat_id,None); await send(chat_id,"Главное меню:",main_kb()); return
+async def handle_state(chat_id, text, state, message):
+    t = state["type"]
+
+    if text == "🔙 Главное меню" and t != "consent":
+        user_states.pop(chat_id, None)
+        await send(chat_id, "Главное меню:", main_kb())
+        return
+
+    if text in {"❌ Отмена", "/cancel"} and t != "consent":
+        user_states.pop(chat_id, None)
+        await send(chat_id, "Действие отменено.", main_kb())
+        return
+
     if t=="consent":
         if text=="✅ Я согласен(на)":
             give_consent(chat_id); user_states.pop(chat_id,None); await send(chat_id,"✅ Спасибо. Согласие сохранено. Теперь доступен весь функционал.",main_kb()); return
@@ -262,9 +300,19 @@ async def handle_state(chat_id,text,state,message):
             user_states[chat_id]={"type":"admin_edit_price","product_id":p["id"]}; await send(chat_id,"Введите новую цену:",back_kb()); return
         if text in {"⏸ Скрыть товар","▶️ Показать товар"}:
             set_product_active(p["id"],not p["is_active"]); await admin_product(chat_id,get_product(p["id"])); return
+        if text == "🗑 Удалить товар":
+            deleted, order_count = delete_product(p["id"])
+            user_states.pop(chat_id, None)
+            if deleted:
+                await send(chat_id, "🗑 Товар удалён.", admin_kb())
+            else:
+                await send(
+                    chat_id,
+                    "Товар нельзя удалить: по нему уже есть заказы. Его можно только скрыть.",
+                    admin_kb(),
+                )
+            return
         await admin_product(chat_id,p); return
-    if text in {"❌ Отмена","/cancel"}:
-        user_states.pop(chat_id,None); await send(chat_id,"Действие отменено.",main_kb()); return
     if t=="magic8_question":
         if not text or len(text)>250 or is_bad(text): await send(chat_id,"Сформулируйте короткий и уважительный вопрос.",back_kb()); return
         ok,remaining=consume_magic8_question(chat_id)
@@ -326,12 +374,35 @@ async def handle_state(chat_id,text,state,message):
     if t=="account_manual_phone":
         if not valid_phone(text): await send(chat_id,"Неверный номер.",back_kb()); return
         update_user_field(chat_id,"phone",text); user_states.pop(chat_id,None); await show_account(chat_id); return
+    if t=="review_rating":
+        if text not in {"⭐ 1","⭐⭐ 2","⭐⭐⭐ 3","⭐⭐⭐⭐ 4","⭐⭐⭐⭐⭐ 5"}:
+            await send(chat_id,"Выберите оценку от 1 до 5.",back_kb()); return
+        rating=int(text[-1])
+        user_states[chat_id]={"type":"review_text","order_id":state["order_id"],"rating":rating}
+        await send(chat_id,"Напишите короткий отзыв или напишите «Пропустить».",back_kb()); return
+    if t=="review_text":
+        review_text="" if text.lower()=="пропустить" else text[:1000]
+        add_review(state["order_id"],chat_id,state["rating"],review_text)
+        user_states.pop(chat_id,None)
+        await send(chat_id,"⭐ Спасибо за отзыв!",account_kb()); return
+
     if t=="admin_order":
         if text=="🔙 К списку заказов": user_states.pop(chat_id,None); await admin_orders(chat_id); return
         o=get_order(state["order_id"])
         if not o: user_states.pop(chat_id,None); await send(chat_id,"Заказ не найден.",admin_kb()); return
-        if text not in {"✅ Подтвердить","❌ Отклонить"}: await send(chat_id,"Выберите действие.",admin_order_kb()); return
-        status="confirmed" if text=="✅ Подтвердить" else "rejected"; set_order_status(o["id"],status); user_states.pop(chat_id,None); await send(o["telegram_id"],f"{status_text(status)} Заказ №{o['id']}.",main_kb()); await send(chat_id,f"Статус заказа №{o['id']} изменён: {status_text(status)}",admin_kb()); return
+        if text not in {"✅ Подтвердить","❌ Отклонить","📦 Завершить"}:
+            await send(chat_id,"Выберите действие.",admin_order_kb())
+            return
+        status = {
+            "✅ Подтвердить": "confirmed",
+            "❌ Отклонить": "rejected",
+            "📦 Завершить": "completed",
+        }[text]
+        set_order_status(o["id"], status)
+        user_states.pop(chat_id, None)
+        await send(o["telegram_id"], f"{status_text(status)} Заказ №{o['id']}.", main_kb())
+        await send(chat_id, f"Статус заказа №{o['id']} изменён: {status_text(status)}", admin_kb())
+        return
     if t=="admin_add_name":
         user_states[chat_id]={"type":"admin_add_desc","name":text[:100]}; await send(chat_id,"Введите описание:",back_kb()); return
     if t=="admin_add_desc":
@@ -364,27 +435,43 @@ async def show_magic8(chat_id):
 async def process_update(update):
     if "message" not in update: return
     m=update["message"]; chat_id=int(m["chat"]["id"]); text=(m.get("text") or "").strip()
+    if len(text) > 1000:
+        await send(chat_id,"Сообщение слишком длинное.",main_kb()); return
+    if chat_id != ADMIN_ID and text and is_bad(text):
+        await send(chat_id,"Пожалуйста, общайтесь уважительно. Оскорбительные и нецензурные сообщения не обрабатываются.",main_kb()); return
     if not flood_ok(chat_id): return
     ensure_user(chat_id)
     u=get_user(chat_id)
-    if not u.get("consent_given") and text not in {"/start","✅ Я согласен(на)","❌ Не согласен(на)"}:
-        await welcome(chat_id); user_states[chat_id]={"type":"consent"}; return
     state=user_states.get(chat_id)
-    # Consent must also work after a process restart, when in-memory state is lost.
-    if not u.get("consent_given") and text == "✅ Я согласен(на)":
-        give_consent(chat_id)
+
+    # /start is always a safe reset command once consent has been granted.
+    if u.get("consent_given") and text == "/start":
         user_states.pop(chat_id, None)
-        await send(chat_id, "✅ Спасибо. Согласие сохранено. Теперь доступен весь функционал.", main_kb())
+        await send(chat_id, "🔮 <b>С возвращением!</b>\n\nВыберите действие:", main_kb())
         return
-    if not u.get("consent_given") and text == "❌ Не согласен(на)":
-        await welcome(chat_id)
-        user_states[chat_id] = {"type":"consent"}
+
+    # Consent has priority while it is actually pending. The database is the
+    # source of truth, so a restart cannot accidentally return to onboarding.
+    if not u.get("consent_given"):
+        if text == "✅ Я согласен(на)":
+            give_consent(chat_id)
+            user_states.pop(chat_id, None)
+            await send(chat_id, "✅ Спасибо. Согласие сохранено. Теперь доступен весь функционал.", main_kb())
+            return
+        if text == "❌ Не согласен(на)":
+            user_states[chat_id] = {"type": "consent"}
+            await send(chat_id, "Без согласия бот не сможет сохранять персональные данные и оформлять заказы.", consent_kb())
+            return
+        if text == "/start" or not state or state.get("type") != "consent":
+            user_states[chat_id] = {"type": "consent"}
+            await welcome(chat_id)
+            return
+        await handle_state(chat_id, text, state, m)
         return
+
     if state:
-        await handle_state(chat_id,text,state,m); return
-    if text=="/start":
-        if not u.get("consent_given"): await welcome(chat_id); user_states[chat_id]={"type":"consent"}; return
-        await send(chat_id,"🔮 <b>С возвращением!</b>\n\nВыберите действие:",main_kb()); return
+        await handle_state(chat_id, text, state, m)
+        return
     if text=="/admin" and chat_id==ADMIN_ID: await send(chat_id,"👑 <b>Админ-панель</b>",admin_kb()); return
     if text in {"🔙 Главное меню","🔙 Главнoe меню"}: await send(chat_id,"Главное меню:",main_kb()); return
     if text=="🔮 Предсказание на день": await ai_processing(chat_id,"daily"); await send(chat_id,get_random_prediction(),main_kb()); return
@@ -427,6 +514,16 @@ async def process_update(update):
     if text=="Телефон": user_states[chat_id]={"type":"account_edit_phone"}; await send(chat_id,"Выберите способ указать номер:",phone_kb()); return
     if text=="🔙 Личный кабинет": await show_account(chat_id); return
     if text=="📦 Мои заказы": await show_orders(chat_id); return
+    if text.startswith("⭐ Заказ №") and "оставить отзыв" in text:
+        try:
+            oid=int(text.split("№",1)[1].split(" ",1)[0])
+            order=get_order(oid)
+            if not order or order["telegram_id"] != chat_id or order["status"] != "completed":
+                await send(chat_id,"Этот заказ недоступен для отзыва.",account_kb()); return
+            user_states[chat_id]={"type":"review_rating","order_id":oid}
+            await send(chat_id,"⭐ Оцените заказ:",kb([[{"text":"⭐ 1"},{"text":"⭐⭐ 2"},{"text":"⭐⭐⭐ 3"}],[{"text":"⭐⭐⭐⭐ 4"},{"text":"⭐⭐⭐⭐⭐ 5"}],[{"text":"🔙 Личный кабинет"}]])); return
+        except Exception:
+            await send(chat_id,"Не удалось открыть оценку заказа.",account_kb()); return
     if text=="📊 Мой день":
         u=get_user(chat_id)
         if not u.get("birthdate"): await begin_personal(chat_id); return
@@ -456,6 +553,16 @@ async def process_update(update):
         if text=="💰 Изменить цену": return
         if text in {"⏸ Скрыть товар","▶️ Показать товар"}: return
         if text=="🔙 Админ-панель": await send(chat_id,"👑 <b>Админ-панель</b>",admin_kb()); return
+        if text=="⭐ Отзывы":
+            rows = get_recent_reviews(20)
+            if not rows:
+                await send(chat_id, "⭐ Отзывов пока нет.", admin_kb())
+                return
+            lines = ["⭐ <b>Последние отзывы</b>"]
+            for r in rows:
+                lines.append(f"\nЗаказ №{r[1]} · {r[3]}/5\n{esc(r[4] or 'Без текста')}")
+            await send(chat_id, "\n".join(lines), admin_kb())
+            return
         if text=="👥 Пользователи":
             us=get_all_users(30); await send(chat_id,"\n".join(["👥 <b>Пользователи</b>"]+[f"🆔 {u['telegram_id']} — {esc(u['name'] or 'без имени')}" for u in us]) if us else "Пользователей пока нет.",admin_kb()); return
         if text=="🔔 Уведомления": await send(chat_id,f"🔔 Активных уведомлений: <b>{len(get_active_subscriptions())}</b>",admin_kb()); return
@@ -494,46 +601,33 @@ async def scheduler():
 
 async def bot_leader(app_):
     global bot_lock_conn, bot_lock_cursor
-
     while True:
         try:
             bot_lock_conn, bot_lock_cursor = acquire_bot_lock()
             print("POSTGRES LOCK ACQUIRED")
-
             app_["polling"] = asyncio.create_task(polling())
             app_["scheduler"] = asyncio.create_task(scheduler())
-
-            done, pending = await asyncio.wait(
-                {app_["polling"], app_["scheduler"]},
-                return_when=asyncio.FIRST_EXCEPTION,
-            )
-
+            done, pending = await asyncio.wait({app_["polling"], app_["scheduler"]}, return_when=asyncio.FIRST_EXCEPTION)
             for task in pending:
                 task.cancel()
-
             for task in pending:
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
-
             for task in done:
                 exc = task.exception()
                 if exc:
                     raise exc
-
         except asyncio.CancelledError:
             raise
-
         except Exception as exc:
             print(f"LEADER ERROR: {exc}")
-
         finally:
             for key in ("polling", "scheduler"):
                 task = app_.get(key)
                 if task:
                     task.cancel()
-
             for key in ("polling", "scheduler"):
                 task = app_.get(key)
                 if task:
@@ -543,85 +637,37 @@ async def bot_leader(app_):
                         pass
                     except Exception as exc:
                         print(f"TASK CLEANUP ERROR: {exc}")
-
             app_.pop("polling", None)
             app_.pop("scheduler", None)
-
             if bot_lock_cursor:
-                try:
-                    bot_lock_cursor.close()
-                except Exception:
-                    pass
+                try: bot_lock_cursor.close()
+                except Exception: pass
                 bot_lock_cursor = None
-
             if bot_lock_conn:
-                try:
-                    bot_lock_conn.close()
-                except Exception:
-                    pass
+                try: bot_lock_conn.close()
+                except Exception: pass
                 bot_lock_conn = None
-
-        print("POSTGRES LOCK UNAVAILABLE; RETRYING IN 5 SECONDS")
         await asyncio.sleep(5)
-
 
 async def startup(app_):
     global telegram_session
-
-    # Do not acquire the advisory lock during aiohttp startup.
-    # Render may run old and new instances together during deployment.
     init_db()
     telegram_session = aiohttp.ClientSession()
     app_["leader"] = asyncio.create_task(bot_leader(app_))
 
-
 async def cleanup(app_):
-    global telegram_session, bot_lock_conn, bot_lock_cursor
+    global telegram_session,bot_lock_conn,bot_lock_cursor
+    for k in ("polling","scheduler"):
+        t=app_.get(k)
+        if t: t.cancel()
+    for k in ("polling","scheduler"):
+        t=app_.get(k)
+        if t:
+            try: await t
+            except asyncio.CancelledError: pass
+    if telegram_session: await telegram_session.close(); telegram_session=None
+    if bot_lock_cursor: bot_lock_cursor.close(); bot_lock_cursor=None
+    if bot_lock_conn: bot_lock_conn.close(); bot_lock_conn=None
 
-    leader = app_.get("leader")
-    if leader:
-        leader.cancel()
-        try:
-            await leader
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            print(f"LEADER CLEANUP ERROR: {exc}")
-
-    for key in ("polling", "scheduler"):
-        task = app_.get(key)
-        if task:
-            task.cancel()
-
-    for key in ("polling", "scheduler"):
-        task = app_.get(key)
-        if task:
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:
-                print(f"TASK CLEANUP ERROR: {exc}")
-
-    if telegram_session:
-        await telegram_session.close()
-        telegram_session = None
-
-    if bot_lock_cursor:
-        try:
-            bot_lock_cursor.close()
-        except Exception:
-            pass
-        bot_lock_cursor = None
-
-    if bot_lock_conn:
-        try:
-            bot_lock_conn.close()
-        except Exception:
-            pass
-        bot_lock_conn = None
-
-
-app.on_startup.append(startup)
-app.on_cleanup.append(cleanup)
+app.on_startup.append(startup); app.on_cleanup.append(cleanup)
 if __name__=="__main__": web.run_app(app,host="0.0.0.0",port=PORT)
