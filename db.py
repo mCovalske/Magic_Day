@@ -1,4 +1,4 @@
-# BUILD: PREDBOT-2026-08-18-LEGAL-FIX-03
+# BUILD: PREDBOT-2026-08-18-ADMIN-STAGE1-01
 import os
 from typing import Optional
 import psycopg2
@@ -46,6 +46,7 @@ def init_db():
                     gender_enc TEXT NOT NULL DEFAULT '',
                     birthdate_enc TEXT NOT NULL DEFAULT '',
                     phone_enc TEXT,
+                    username_enc TEXT,
                     consent_given BOOLEAN NOT NULL DEFAULT FALSE,
                     consent_version TEXT,
                     consent_at TIMESTAMPTZ,
@@ -61,6 +62,9 @@ def init_db():
             """)
             cur.execute("""
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS consent_at TIMESTAMPTZ
+            """)
+            cur.execute("""
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS username_enc TEXT
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS products (
@@ -87,10 +91,15 @@ def init_db():
                     customer_name_enc TEXT NOT NULL,
                     customer_phone_enc TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'new'
-                        CHECK (status IN ('new','confirmed','rejected','completed')),
+                        CHECK (status IN ('new','confirmed','assembling','ready','shipping','completed','rejected')),
                     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
+            """)
+            cur.execute("ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_status_check")
+            cur.execute("""
+                ALTER TABLE orders ADD CONSTRAINT orders_status_check
+                CHECK (status IN ('new','confirmed','assembling','ready','shipping','completed','rejected'))
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS subscriptions (
@@ -107,6 +116,24 @@ def init_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_subs_time ON subscriptions(active, time_local)")
             cur.execute("""CREATE TABLE IF NOT EXISTS magic8_usage (telegram_id BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE, usage_date DATE, question_count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (telegram_id, usage_date))""")
             cur.execute("""CREATE TABLE IF NOT EXISTS reviews (id BIGSERIAL PRIMARY KEY, order_id BIGINT UNIQUE REFERENCES orders(id) ON DELETE CASCADE, telegram_id BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE, rating INTEGER CHECK (rating BETWEEN 1 AND 5), review_text TEXT, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS admin_audit (
+                    id BIGSERIAL PRIMARY KEY, admin_id BIGINT NOT NULL, action TEXT NOT NULL,
+                    entity_type TEXT, entity_id TEXT, details TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS admin_settings (
+                    id INTEGER PRIMARY KEY CHECK (id=1),
+                    notify_new_order BOOLEAN NOT NULL DEFAULT TRUE,
+                    notify_status_change BOOLEAN NOT NULL DEFAULT TRUE,
+                    notify_new_user BOOLEAN NOT NULL DEFAULT FALSE,
+                    notify_security BOOLEAN NOT NULL DEFAULT TRUE,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("INSERT INTO admin_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
             seed_products(cur)
         conn.commit()
     except Exception:
@@ -172,7 +199,7 @@ def get_user(telegram_id: int):
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT name_enc, gender_enc, birthdate_enc, phone_enc,
-                       consent_given, consent_version, consent_at, created_at
+                       username_enc, consent_given, consent_version, consent_at, created_at
                 FROM users WHERE telegram_id = %s
             """, (telegram_id,))
             row = cur.fetchone()
@@ -186,11 +213,36 @@ def get_user(telegram_id: int):
         "gender": decrypt(row[1]),
         "birthdate": decrypt(row[2]),
         "phone": decrypt(row[3]) if row[3] else "",
-        "consent_given": bool(row[4]),
-        "consent_version": row[5] or "",
-        "consent_at": row[6],
-        "created_at": row[7],
+        "username": decrypt(row[4]) if row[4] else "",
+        "consent_given": bool(row[5]),
+        "consent_version": row[6] or "",
+        "consent_at": row[7],
+        "created_at": row[8],
     }
+
+
+def update_username(telegram_id: int, username: str):
+    username=(username or "").strip().lstrip("@").lower()
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET username_enc=%s, updated_at=CURRENT_TIMESTAMP WHERE telegram_id=%s",(encrypt(username),telegram_id))
+        conn.commit()
+    finally: conn.close()
+
+def get_user_by_username(username: str):
+    username=(username or "").strip().lstrip("@").lower()
+    if not username: return None
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT telegram_id, username_enc FROM users WHERE username_enc IS NOT NULL")
+            rows=cur.fetchall()
+    finally: conn.close()
+    for telegram_id, username_enc in rows:
+        if decrypt(username_enc).lower()==username:
+            return get_user(telegram_id)
+    return None
 
 
 def update_user_field(telegram_id: int, field: str, value: str):
@@ -281,6 +333,15 @@ def update_product(product_id: int, field: str, value):
         conn.commit()
     finally:
         conn.close()
+
+
+def update_product_image(product_id:int,image_file):
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE products SET image_file=%s, updated_at=CURRENT_TIMESTAMP WHERE id=%s",(image_file,product_id))
+        conn.commit()
+    finally: conn.close()
 
 
 def set_product_active(product_id: int, active: bool):
@@ -384,7 +445,7 @@ def get_recent_orders(limit=30):
 
 
 def set_order_status(order_id: int, status: str):
-    if status not in {"new", "confirmed", "rejected", "completed"}:
+    if status not in {"new", "confirmed", "assembling", "ready", "shipping", "completed", "rejected"}:
         raise ValueError("Invalid status")
     conn = get_conn()
     try:
@@ -434,6 +495,97 @@ def get_active_subscriptions(time_local: Optional[str] = None):
         conn.close()
     return [{"telegram_id": r[0], "time": r[1]} for r in rows]
 
+
+def get_analytics(days=None):
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur:
+            if days:
+                since="CURRENT_TIMESTAMP - (%s * INTERVAL '1 day')"; arg=(days,)
+                cur.execute(f"SELECT COUNT(*) FROM users WHERE created_at >= {since}",arg); users=cur.fetchone()[0]
+                cur.execute(f"SELECT COUNT(*) FROM orders WHERE created_at >= {since}",arg); orders=cur.fetchone()[0]
+                cur.execute(f"SELECT COUNT(*) FROM orders WHERE created_at >= {since} AND status='new'",arg); new_orders=cur.fetchone()[0]
+            else:
+                cur.execute("SELECT COUNT(*) FROM users"); users=cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM orders"); orders=cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM orders WHERE status='new'"); new_orders=cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM orders WHERE status='confirmed'"); confirmed=cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM orders WHERE status='assembling'"); assembling=cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM orders WHERE status='ready'"); ready=cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM orders WHERE status='shipping'"); shipping=cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM orders WHERE status='completed'"); completed=cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM orders WHERE status='rejected'"); rejected=cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM users WHERE created_at>=CURRENT_DATE"); new_today=cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM subscriptions WHERE active=TRUE"); subs=cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM reviews"); reviews=cur.fetchone()[0]
+            cur.execute("SELECT COALESCE(AVG(rating),0) FROM reviews"); avg_rating=float(cur.fetchone()[0])
+            cur.execute("SELECT product_name_snapshot,COUNT(*) FROM orders GROUP BY product_name_snapshot ORDER BY COUNT(*) DESC LIMIT 1"); top=cur.fetchone()
+            cur.execute("SELECT COUNT(*) FROM users WHERE consent_given=TRUE"); consented=cur.fetchone()[0]
+        return {"users":users,"new_today":new_today,"orders":orders,"new_orders":new_orders,"confirmed":confirmed,"assembling":assembling,"ready":ready,"shipping":shipping,"completed":completed,"rejected":rejected,"subscriptions":subs,"reviews":reviews,"avg_rating":avg_rating,"top_product":top[0] if top else None,"consented":consented}
+    finally: conn.close()
+
+def search_users(query,limit=20):
+    q=(query or '').lower().strip(); conn=get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT telegram_id,name_enc,phone_enc,username_enc,birthdate_enc,created_at FROM users ORDER BY created_at DESC")
+            rows=cur.fetchall()
+    finally: conn.close()
+    result=[]
+    for r in rows:
+        vals=[str(r[0]),decrypt(r[1]),decrypt(r[2]) if r[2] else '',decrypt(r[3]) if r[3] else '',decrypt(r[4])]
+        if q in ' '.join(vals).lower():
+            result.append({"telegram_id":r[0],"name":vals[1],"phone":vals[2],"username":vals[3],"birthdate":vals[4],"created_at":r[5]})
+            if len(result)>=limit: break
+    return result
+
+def get_user_admin_card(telegram_id):
+    u=get_user(telegram_id)
+    return None if not u else {"user":u,"orders":get_user_orders(telegram_id)}
+
+def add_admin_audit(admin_id,action,entity_type='',entity_id='',details=''):
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO admin_audit(admin_id,action,entity_type,entity_id,details) VALUES(%s,%s,%s,%s,%s)",(admin_id,action,entity_type,str(entity_id),details[:2000]))
+        conn.commit()
+    finally: conn.close()
+
+def get_admin_audit(limit=30):
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,admin_id,action,entity_type,entity_id,details,created_at FROM admin_audit ORDER BY created_at DESC LIMIT %s",(limit,)); return cur.fetchall()
+    finally: conn.close()
+
+def get_admin_settings():
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT notify_new_order,notify_status_change,notify_new_user,notify_security FROM admin_settings WHERE id=1"); r=cur.fetchone()
+    finally: conn.close()
+    if not r: return {"new_order":True,"status_change":True,"new_user":False,"security":True}
+    return {"new_order":bool(r[0]),"status_change":bool(r[1]),"new_user":bool(r[2]),"security":bool(r[3])}
+
+def set_admin_notifications(field,enabled):
+    cols={"new_order":"notify_new_order","status_change":"notify_status_change","new_user":"notify_new_user","security":"notify_security"}
+    if field not in cols: raise ValueError('unsupported setting')
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE admin_settings SET {cols[field]}=%s,updated_at=CURRENT_TIMESTAMP WHERE id=1",(enabled,)); conn.commit()
+    finally: conn.close()
+
+def get_broadcast_recipients(audience):
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur:
+            if audience=='all': cur.execute("SELECT telegram_id FROM users WHERE consent_given=TRUE")
+            elif audience=='subscribed': cur.execute("SELECT telegram_id FROM subscriptions WHERE active=TRUE")
+            elif audience=='buyers': cur.execute("SELECT DISTINCT telegram_id FROM orders")
+            else: cur.execute("SELECT telegram_id FROM users WHERE consent_given=TRUE AND created_at>=CURRENT_DATE")
+            return [r[0] for r in cur.fetchall()]
+    finally: conn.close()
 
 def get_stats():
     conn = get_conn()
