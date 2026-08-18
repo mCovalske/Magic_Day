@@ -18,6 +18,59 @@ except Exception as exc:
     raise RuntimeError("ENCRYPTION_KEY is invalid") from exc
 
 
+
+def reset_all_user_data_once():
+    """
+    One-time destructive reset for development.
+    Removes all user profiles and dependent user data, but keeps the catalog.
+    """
+    enabled = os.getenv("RESET_USER_DATA_ON_START", "false").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if not enabled:
+        return False
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS system_migrations (
+                    migration_key TEXT PRIMARY KEY,
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                SELECT 1
+                FROM system_migrations
+                WHERE migration_key = 'RESET_ALL_USER_DATA_2026_08_18'
+            """)
+            if cur.fetchone():
+                conn.commit()
+                return False
+
+            cur.execute("""
+                TRUNCATE TABLE
+                    reviews,
+                    magic8_usage,
+                    subscriptions,
+                    orders,
+                    users
+                RESTART IDENTITY CASCADE
+            """)
+
+            cur.execute("""
+                INSERT INTO system_migrations (migration_key)
+                VALUES ('RESET_ALL_USER_DATA_2026_08_18')
+            """)
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def get_conn():
     return psycopg2.connect(DATABASE_URL, connect_timeout=10)
 
