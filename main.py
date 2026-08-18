@@ -1,4 +1,4 @@
-# BUILD: PREDBOT-2026-08-18-GIFT-NOTIFY-01
+# BUILD: PREDBOT-2026-08-18-LEGAL-PACK-02
 import asyncio
 import html
 import os
@@ -11,10 +11,10 @@ import aiohttp
 from aiohttp import web
 
 from db import (
+    CONSENT_VERSION,
     add_review, consume_magic8_question, delete_product, delete_user_data, give_consent, get_magic8_remaining, get_recent_reviews,
     acquire_bot_lock, add_product, create_order, ensure_user, get_active_subscriptions,
     get_all_users, get_order, get_product, get_product_by_name, get_products, get_recent_orders,
-    get_user_by_username, update_username,
     get_stats, get_subscription, get_user, get_user_orders, init_db, set_order_status,
     set_product_active, set_subscription, update_product, update_user_field,
 )
@@ -27,7 +27,9 @@ PORT = int(os.getenv("PORT", "10000"))
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
+LEGAL_DIR = STATIC_DIR / "legal"
 IMAGES_DIR = STATIC_DIR / "images"
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 if ADMIN_ID <= 0:
@@ -53,16 +55,27 @@ def main_kb():
         [{"text": "🎯 По сферам"}, {"text": "💎 Каталог"}],
         [{"text": "🎱 Чёрный шар 8"}, {"text": "🎁 Подарок другу"}],
         [{"text": "🔔 Уведомления"}, {"text": "👤 Личный кабинет"}],
+        [{"text": "📄 Правовые документы"}],
     ])
 
 
 def consent_kb():
     return kb([
-        [{"text": "✅ Я согласен(на)"}],
+        [{"text": "✅ Ознакомился(лась) и даю согласие"}],
         [{"text": "❌ Не согласен(на)"}],
     ])
 
 def back_kb(): return kb([[{"text": "🔙 Главное меню"}]])
+def legal_kb():
+    return kb([
+        [{"text": "🔐 Политика ПДн"}, {"text": "✅ Согласие ПДн"}],
+        [{"text": "🛡 Конфиденциальность"}, {"text": "📜 Пользовательское соглашение"}],
+        [{"text": "🛒 Публичная оферта"}, {"text": "⚠️ Дисклеймер"}],
+        [{"text": "📣 Рекламное согласие"}, {"text": "📩 Права субъекта ПДн"}],
+        [{"text": "🔙 Главное меню"}],
+    ])
+
+
 def gender_kb(): return kb([[{"text": "👨 Мужчина"}, {"text": "👩 Женщина"}], [{"text": "🙂 Не хочу указывать"}], [{"text": "🔙 Главное меню"}]], True)
 def phone_kb(): return {"keyboard":[[{"text":"📱 Отправить мой номер","request_contact":True}],[{"text":"⌨️ Ввести номер вручную"}],[{"text":"❌ Отмена"}]],"resize_keyboard":True,"one_time_keyboard":True,"is_persistent":False}
 def sphere_kb(): return kb([[{"text":"❤️ Любовь"},{"text":"💼 Карьера"}],[{"text":"💰 Финансы"},{"text":"👨‍👩‍👧 Семья"}],[{"text":"🌿 Самочувствие"},{"text":"📚 Развитие"}],[{"text":"🔙 Главное меню"}]])
@@ -118,32 +131,34 @@ async def send_photo(chat_id, filename, caption=None):
     return True
 
 async def ai_processing(chat_id, kind="daily"):
-    steps = {
-        "daily": [
-            "🔮 Анализирую энергетику сегодняшнего дня...",
-            "✨ Сопоставляю ключевые тенденции...",
-            "📚 Формирую прогноз...",
-        ],
-        "personal": [
-            "🔮 Анализирую ваши данные...",
-            "✨ Формирую персональный профиль...",
-            "📚 Собираю прогноз на сегодня...",
-        ],
-        "sphere": [
-            "🔮 Анализирую дату рождения...",
-            "✨ Сопоставляю выбранную сферу...",
-            "📚 Формирую персональный ответ...",
-        ],
-    }[kind]
+    await send_photo(chat_id,"ai_processing.png")
+    steps={"daily":["🔮 Анализирую энергетику сегодняшнего дня...","✨ Сопоставляю тенденции...","📚 Формирую прогноз..."],"personal":["🔮 Анализирую ваши данные...","✨ Формирую персональный профиль...","📚 Собираю прогноз на сегодня..."],"sphere":["🔮 Анализирую дату рождения...","✨ Сопоставляю выбранную сферу...","📚 Формирую персональный ответ..."]}[kind]
     for step in steps:
-        await typing(chat_id)
-        await send(chat_id, step)
-        await asyncio.sleep(0.65)
-
+        await typing(chat_id); await send(chat_id,step); await asyncio.sleep(.65)
 
 async def welcome(chat_id):
-    await send_photo(chat_id,"welcome.png")
-    await send(chat_id,"🔮 <b>Добро пожаловать!</b>\n\nЭто развлекательный бот предсказаний, персональных прогнозов, ответов Чёрного шара 8 и каталога бусин Дзи.\n\nПеред началом бот должен получить ваше добровольное согласие на обработку и хранение предоставленных персональных данных.",consent_kb())
+    await send_photo(chat_id, "welcome.png")
+    links = []
+    if PUBLIC_URL:
+        links = [
+            f'<a href="{esc(legal_url("01_policy_personal_data.html"))}">Политика обработки ПДн</a>',
+            f'<a href="{esc(legal_url("02_consent_personal_data.html"))}">Согласие на обработку ПДн</a>',
+            f'<a href="{esc(legal_url("03_confidentiality_security.html"))}">Конфиденциальность и защита</a>',
+            f'<a href="{esc(legal_url("04_user_agreement.html"))}">Пользовательское соглашение</a>',
+            f'<a href="{esc(legal_url("05_public_offer.html"))}">Публичная оферта</a>',
+            f'<a href="{esc(legal_url("06_disclaimer_predictions.html"))}">Дисклеймер прогнозов</a>',
+        ]
+    docs_text = "\n".join(links) if links else "Ссылки появятся после настройки PUBLIC_URL."
+    await send(
+        chat_id,
+        "🔮 <b>Добро пожаловать!</b>\n\n"
+        "Предсказания на день, персональные прогнозы, 6 сфер, Чёрный шар 8, "
+        "каталог бусин Дзи, заказы, уведомления и личный кабинет.\n\n"
+        "Перед началом, пожалуйста, ознакомьтесь с документами:\n\n"
+        f"{docs_text}\n\n"
+        "После ознакомления отдельно подтвердите согласие на обработку ваших персональных данных.",
+        consent_kb(),
+    )
 
 async def typing(chat_id): return await tg("sendChatAction",{"chat_id":chat_id,"action":"typing"})
 
@@ -183,7 +198,37 @@ async def homepage(request):
     f=STATIC_DIR/"index.html"
     return web.FileResponse(f) if f.exists() else web.Response(text="OK")
 async def health(request): return web.json_response({"status":"ok","build":"PREDBOT-2026-08-18-FULL-CHECK-02"})
-app.router.add_get("/",homepage); app.router.add_get("/health",health); app.router.add_static("/static",path=str(STATIC_DIR),name="static")
+app.router.add_get("/",homepage); app.router.add_get("/health",health); app.router.add_static("/static",path=str(STATIC_DIR),name="static"); app.router.add_static("/legal",path=str(LEGAL_DIR),name="legal")
+
+def legal_url(filename):
+    base = PUBLIC_URL or ""
+    return f"{base}/legal/{filename}"
+
+async def show_legal_documents(chat_id):
+    if not PUBLIC_URL:
+        await send(
+            chat_id,
+            "📄 <b>Правовые документы</b>\n\n"
+            "Ссылки временно недоступны: администратору необходимо настроить переменную PUBLIC_URL в Render.",
+            main_kb(),
+        )
+        return
+
+    links = [
+        (f'<a href="{esc(legal_url("01_policy_personal_data.html"))}">Политика обработки персональных данных</a>'),
+        (f'<a href="{esc(legal_url("02_consent_personal_data.html"))}">Согласие на обработку персональных данных</a>'),
+        (f'<a href="{esc(legal_url("03_confidentiality_security.html"))}">Политика конфиденциальности и защиты информации</a>'),
+        (f'<a href="{esc(legal_url("04_user_agreement.html"))}">Пользовательское соглашение</a>'),
+        (f'<a href="{esc(legal_url("05_public_offer.html"))}">Публичная оферта</a>'),
+        (f'<a href="{esc(legal_url("06_disclaimer_predictions.html"))}">Дисклеймер прогнозов</a>'),
+        (f'<a href="{esc(legal_url("07_marketing_consent.html"))}">Согласие на рекламные сообщения</a>'),
+        (f'<a href="{esc(legal_url("08_data_subject_requests.html"))}">Порядок реализации прав субъекта ПДн</a>'),
+    ]
+    await send(
+        chat_id,
+        "📄 <b>Правовые документы</b>\n\n" + "\n\n".join(links),
+        legal_kb(),
+    )
 
 async def ensure_profile(chat_id): ensure_user(chat_id); return get_user(chat_id)
 
@@ -282,7 +327,7 @@ async def handle_state(chat_id, text, state, message):
         return
 
     if t=="consent":
-        if text=="✅ Я согласен(на)":
+        if text=="✅ Ознакомился(лась) и даю согласие":
             give_consent(chat_id); user_states.pop(chat_id,None); await send(chat_id,"✅ Спасибо. Согласие сохранено. Теперь доступен весь функционал.",main_kb()); return
         if text=="❌ Не согласен(на)":
             await send(chat_id,"Без согласия бот не сможет сохранять ваши персональные данные и оформлять заказ.",consent_kb()); return
@@ -364,25 +409,6 @@ async def handle_state(chat_id, text, state, message):
     if t=="notification_custom_time":
         if not valid_time(text): await send(chat_id,"Неверное время. Пример: 09:30",back_kb()); return
         set_subscription(chat_id,text,True); user_states.pop(chat_id,None); await send(chat_id,f"🔔 Уведомления включены на {text} по Москве.",main_kb()); return
-    if t=="gift_prediction_username":
-        username = text.strip()
-        if not username.startswith("@") or len(username) < 2 or len(username) > 33:
-            await send(chat_id, "Неверный формат. Введите логин в формате <b>@username</b>.", back_kb())
-            return
-        recipient = get_user_by_username(username)
-        if not recipient:
-            user_states.pop(chat_id, None)
-            await send(chat_id, "Я не нашёл этого пользователя среди тех, кто уже запускал нашего бота. Telegram не позволяет боту первым написать человеку, который ещё не взаимодействовал с ним.\n\nПопросите получателя открыть бота и нажать /start, затем повторите отправку.", main_kb())
-            return
-        if recipient["telegram_id"] == chat_id:
-            await send(chat_id, "Нельзя отправить подарок самому себе. Укажите другой @username.", back_kb())
-            return
-        user_states.pop(chat_id, None)
-        await ai_processing(chat_id, "daily")
-        prediction = get_random_prediction()
-        await send(recipient["telegram_id"], "🎁 <b>Вам подарили предсказание!</b>\n\n" + prediction, main_kb())
-        await send(chat_id, f"✅ Предсказание отправлено пользователю <b>{esc(username)}</b>.", main_kb())
-        return
     if t=="order_name":
         if not text: await send(chat_id,"Введите имя:",back_kb()); return
         user_states[chat_id]={"type":"order_phone","product_id":state["product_id"],"name":text[:50]}; await send(chat_id,"Теперь укажите номер телефона для связи.",phone_kb()); return
@@ -472,16 +498,7 @@ async def show_magic8(chat_id):
 
 async def process_update(update):
     if "message" not in update: return
-    m=update["message"]
-    chat_id=int(m["chat"]["id"])
-    text=(m.get("text") or "").strip()
-    sender=m.get("from") or {}
-    sender_username=(sender.get("username") or "").strip().lstrip("@").lower()
-    if sender_username:
-        try:
-            update_username(chat_id, sender_username)
-        except Exception as exc:
-            print(f"USERNAME UPDATE ERROR: {exc}")
+    m=update["message"]; chat_id=int(m["chat"]["id"]); text=(m.get("text") or "").strip()
     if len(text) > 1000:
         await send(chat_id,"Сообщение слишком длинное.",main_kb()); return
     if chat_id != ADMIN_ID and text and is_bad(text):
@@ -497,17 +514,27 @@ async def process_update(update):
         await send(chat_id, "🔮 <b>С возвращением!</b>\n\nВыберите действие:", main_kb())
         return
 
-    # Consent has priority while it is actually pending. The database is the
-    # source of truth, so a restart cannot accidentally return to onboarding.
-    if not u.get("consent_given"):
-        if text == "✅ Я согласен(на)":
+    # Consent is the source of truth. If the published consent version changes,
+    # the user must see the documents and explicitly confirm the new version.
+    consent_ok = bool(u.get("consent_given")) and u.get("consent_version") == CONSENT_VERSION
+
+    if not consent_ok:
+        if text == "✅ Ознакомился(лась) и даю согласие":
             give_consent(chat_id)
             user_states.pop(chat_id, None)
-            await send(chat_id, "✅ Спасибо. Согласие сохранено. Теперь доступен весь функционал.", main_kb())
+            await send(
+                chat_id,
+                f"✅ Спасибо. Согласие сохранено (версия {CONSENT_VERSION}). Теперь доступен весь функционал.",
+                main_kb(),
+            )
             return
         if text == "❌ Не согласен(на)":
             user_states[chat_id] = {"type": "consent"}
-            await send(chat_id, "Без согласия бот не сможет сохранять персональные данные и оформлять заказы.", consent_kb())
+            await send(
+                chat_id,
+                "Без согласия бот не сможет сохранять ваши персональные данные и использовать функции, для которых они необходимы.",
+                consent_kb(),
+            )
             return
         if text == "/start" or not state or state.get("type") != "consent":
             user_states[chat_id] = {"type": "consent"}
@@ -533,10 +560,8 @@ async def process_update(update):
         user_states[chat_id]={"type":"magic8_question"}; await send(chat_id,"Сформулируйте вопрос, на который возможен ответ «Да» или «Нет».",back_kb()); return
     if text=="🎁 Подарок другу":
         await send(chat_id,"🎁 <b>Подарок другу</b>\n\nВыберите подарок:",kb([[{"text":"🔮 Подарить предсказание"}],[{"text":"💎 Подарить браслет"}],[{"text":"🔙 Главное меню"}]])); return
-    if text == "🔮 Подарить предсказание":
-        user_states[chat_id] = {"type": "gift_prediction_username"}
-        await send(chat_id, "🎁 <b>Подарить предсказание</b>\n\nВведите Telegram-логин получателя в формате <b>@username</b>.", back_kb())
-        return
+    if text=="🔮 Подарить предсказание":
+        await ai_processing(chat_id,"daily"); await send(chat_id,"🎁 <b>Предсказание для друга</b>\n\n"+get_random_prediction()+"\n\nПерешлите это сообщение другу.",main_kb()); return
     if text=="💎 Подарить браслет": await show_catalog(chat_id); return
     if text=="🔙 К каталогу": await show_catalog(chat_id); return
     product=get_product_by_name(text)
@@ -552,6 +577,35 @@ async def process_update(update):
         if not name: user_states[chat_id]={"type":"order_name","product_id":p["id"]}; await send(chat_id,"Как вас зовут для оформления заказа?",back_kb()); return
         if not phone: user_states[chat_id]={"type":"order_phone","product_id":p["id"],"name":name}; await send(chat_id,"Укажите номер телефона:",phone_kb()); return
         user_states[chat_id]={"type":"order_confirm","product_id":p["id"],"name":name,"phone":phone}; price=f"{p['price_rub']:,}".replace(","," "); await send(chat_id,f"🧾 <b>Проверьте заказ</b>\n\n💎 {esc(p['name'])}\n💰 {price} ₽\n👤 {esc(name)}\n📞 {esc(phone)}\n\nВсё верно?",order_confirm_kb()); return
+    if text == "📄 Правовые документы":
+        await show_legal_documents(chat_id)
+        return
+
+    if text == "🔐 Политика ПДн":
+        await show_legal_documents(chat_id)
+        return
+    if text == "✅ Согласие ПДн":
+        await show_legal_documents(chat_id)
+        return
+    if text == "🛡 Конфиденциальность":
+        await show_legal_documents(chat_id)
+        return
+    if text == "📜 Пользовательское соглашение":
+        await show_legal_documents(chat_id)
+        return
+    if text == "🛒 Публичная оферта":
+        await show_legal_documents(chat_id)
+        return
+    if text == "⚠️ Дисклеймер":
+        await show_legal_documents(chat_id)
+        return
+    if text == "📣 Рекламное согласие":
+        await show_legal_documents(chat_id)
+        return
+    if text == "📩 Права субъекта ПДн":
+        await show_legal_documents(chat_id)
+        return
+
     if text=="🔔 Уведомления": await show_notifications(chat_id); return
     if text in {"🔔 Включить уведомления","🕒 Изменить время"}: user_states[chat_id]={"type":"notification_time"}; await send(chat_id,"Выберите время:",time_kb()); return
     if text=="🔕 Отписаться": set_subscription(chat_id,"00:00",False); await send(chat_id,"🔕 Уведомления отключены.",main_kb()); return
@@ -641,11 +695,7 @@ async def scheduler():
                 key=(sub["telegram_id"],day,hhmm)
                 if last_notification_sent.get(sub["telegram_id"])==key: continue
                 try:
-                    await send(
-                        sub["telegram_id"],
-                        "🔔 <b>Ваше предсказание на день готово!</b>\n\n✨ Загляните в чат-бот и узнайте, что вас ждёт сегодня.",
-                        main_kb(),
-                    )
+                    await send(sub["telegram_id"],"🔔 <b>Ваше предсказание на день готово</b>\n\nУзнайте, что вас ждёт.\n\n"+get_random_prediction(),main_kb())
                     last_notification_sent[sub["telegram_id"]]=key
                 except Exception as exc: print(f"NOTIFICATION ERROR: {exc}")
         except asyncio.CancelledError: raise
