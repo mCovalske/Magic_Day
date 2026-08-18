@@ -1,4 +1,4 @@
-# BUILD: PREDBOT-2026-08-18-LEGAL-PACK-02
+# BUILD: PREDBOT-2026-08-18-LEGAL-FIX-03
 import os
 from typing import Optional
 import psycopg2
@@ -153,7 +153,7 @@ def give_consent(telegram_id: int):
     conn=get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("""UPDATE users SET consent_given=TRUE, consent_version=CONSENT_VERSION, consent_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE telegram_id=%s""",(telegram_id,))
+            cur.execute("""UPDATE users SET consent_given=TRUE, consent_version=%s, consent_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE telegram_id=%s""",(CONSENT_VERSION, telegram_id))
         conn.commit()
     finally: conn.close()
 
