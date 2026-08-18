@@ -1,4 +1,4 @@
-# BUILD: PREDBOT-2026-08-18-ADMIN-STAGE1-01
+# BUILD: PREDBOT-2026-08-18-ID-ACCESS-RESET-01
 import asyncio
 import html
 import os
@@ -11,6 +11,7 @@ import aiohttp
 from aiohttp import web
 
 from db import (
+    reset_all_user_data_once,
     CONSENT_VERSION,
     add_review, consume_magic8_question, delete_product, delete_user_data, give_consent, get_magic8_remaining, get_recent_reviews,
     acquire_bot_lock, add_product, create_order, ensure_user, get_active_subscriptions,
@@ -33,6 +34,19 @@ STATIC_DIR = BASE_DIR / "static"
 LEGAL_DIR = STATIC_DIR / "legal"
 IMAGES_DIR = STATIC_DIR / "images"
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
+BOT_ACCESS_MODE = os.getenv("BOT_ACCESS_MODE", "development").strip().lower()
+
+def parse_user_ids(value):
+    result = set()
+    for item in value.split(","):
+        item = item.strip()
+        if item.isdigit():
+            result.add(int(item))
+    return result
+
+ALLOWED_USER_IDS = parse_user_ids(os.getenv("ALLOWED_USER_IDS", ""))
+
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 if ADMIN_ID <= 0:
@@ -50,6 +64,26 @@ MAX_ACTIONS_PER_MINUTE = 20
 
 def kb(rows, one_time=False):
     return {"keyboard": rows, "resize_keyboard": True, "one_time_keyboard": one_time, "is_persistent": False}
+
+
+def is_admin(chat_id):
+    return chat_id == ADMIN_ID
+
+
+def is_access_allowed(chat_id):
+    if BOT_ACCESS_MODE == "production":
+        return True
+    if chat_id == ADMIN_ID:
+        return True
+    return chat_id in ALLOWED_USER_IDS
+
+
+def restricted_access_message():
+
+    return (
+        "🔒 <b>Бот находится в режиме разработки.</b>\n\n"
+        "Доступ открыт только владельцу и назначенным тестировщикам."
+    )
 
 
 def main_kb():
@@ -603,6 +637,9 @@ async def process_update(update):
     if uname:
         try: update_username(chat_id,uname)
         except Exception: pass
+    if not is_access_allowed(chat_id):
+        await send(chat_id, restricted_access_message())
+        return
     if len(text) > 1000:
         await send(chat_id,"Сообщение слишком длинное.",main_kb()); return
     if chat_id != ADMIN_ID and text and is_bad(text):
@@ -670,7 +707,7 @@ async def process_update(update):
     if state:
         await handle_state(chat_id, text, state, m)
         return
-    if text=="/admin" and chat_id==ADMIN_ID: await send(chat_id,"👑 <b>Админ-панель</b>",admin_kb()); return
+    if text=="/admin" and chat_id==ADMIN_ID: await send(chat_id,f"👑 <b>Админ-панель</b>\n\nРежим доступа: <b>{BOT_ACCESS_MODE}</b>\nТестировщиков: <b>{len(ALLOWED_USER_IDS)}</b>",admin_kb()); return
     if text in {"🔙 Главное меню","🔙 Главнoe меню"}: await send(chat_id,"Главное меню:",main_kb()); return
     if text=="🔮 Предсказание на день": await ai_processing(chat_id,"daily"); await send(chat_id,get_random_prediction(),main_kb()); return
     if text=="✨ Персональное": await begin_personal(chat_id); return
@@ -852,6 +889,9 @@ async def bot_leader(app_):
 async def startup(app_):
     global telegram_session
     init_db()
+
+    if reset_all_user_data_once():
+        print("USER DATA RESET COMPLETED")
     telegram_session = aiohttp.ClientSession()
     app_["leader"] = asyncio.create_task(bot_leader(app_))
 
