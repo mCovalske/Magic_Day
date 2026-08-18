@@ -1,4 +1,4 @@
-# BUILD: PREDBOT-2026-08-18-LEGAL-WEBAPP-01
+# BUILD: PREDBOT-2026-08-18-ADMIN-STAGE1-01
 import asyncio
 import html
 import os
@@ -15,7 +15,10 @@ from db import (
     add_review, consume_magic8_question, delete_product, delete_user_data, give_consent, get_magic8_remaining, get_recent_reviews,
     acquire_bot_lock, add_product, create_order, ensure_user, get_active_subscriptions,
     get_all_users, get_order, get_product, get_product_by_name, get_products, get_recent_orders,
+    get_user_by_username, update_username,
     get_stats, get_subscription, get_user, get_user_orders, init_db, set_order_status,
+    get_analytics, search_users, get_user_admin_card, get_admin_audit, add_admin_audit,
+    get_admin_settings, set_admin_notifications, get_broadcast_recipients, update_product_image,
     set_product_active, set_subscription, update_product, update_user_field,
 )
 from personal import SPHERES, get_personal_forecast, get_sphere_forecast
@@ -110,8 +113,10 @@ def time_kb():
     return kb(rows, True)
 
 
-def admin_kb(): return kb([[{"text":"📊 Статистика"},{"text":"📦 Заказы"}],[{"text":"🛍 Каталог"},{"text":"🔔 Уведомления"}],[{"text":"⭐ Отзывы"},{"text":"👥 Пользователи"}],[{"text":"📣 Рассылка"},{"text":"🚪 Выйти"}]])
-def admin_order_kb(): return kb([[{"text":"✅ Подтвердить"},{"text":"❌ Отклонить"}],[{"text":"📦 Завершить"}],[{"text":"🔙 К списку заказов"}]])
+def admin_kb():
+    return kb([[{"text":"📊 Аналитика"},{"text":"📦 Заказы"}],[{"text":"👥 Пользователи"},{"text":"🛍 Каталог"}],[{"text":"📣 Рассылка"},{"text":"🚨 Уведомления"}],[{"text":"🛡 Журнал"},{"text":"⭐ Отзывы"}],[{"text":"🚪 Выйти"}]])
+def admin_order_kb():
+    return kb([[{"text":"✅ Подтвердить"},{"text":"❌ Отклонить"}],[{"text":"🔧 В сборке"},{"text":"📦 Готов"}],[{"text":"🚚 В доставке"},{"text":"✅ Завершить"}],[{"text":"🔙 К списку заказов"}]])
 def admin_product_kb(active): return kb([[{"text":"✏️ Изменить название"}],[{"text":"📝 Изменить описание"}],[{"text":"💰 Изменить цену"}],[{"text":"⏸ Скрыть товар" if active else "▶️ Показать товар"}],[{"text":"🗑 Удалить товар"}],[{"text":"🔙 Каталог админа"}]])
 
 async def tg(method, payload=None, timeout=30):
@@ -309,6 +314,38 @@ async def show_notifications(chat_id):
     else:
         await send(chat_id,"🔔 <b>Ежедневные уведомления</b>\n\nЯ буду сообщать: «Ваше предсказание на день готово — узнайте, что вас ждёт». Выберите удобное время.",notifications_kb(False))
 
+def admin_analytics_kb(): return kb([[{"text":"Сегодня"},{"text":"7 дней"}],[{"text":"30 дней"},{"text":"Всё время"}],[{"text":"🔙 Админ-панель"}]])
+def admin_users_kb(): return kb([[{"text":"🔎 Найти пользователя"}],[{"text":"👥 Последние пользователи"}],[{"text":"🔙 Админ-панель"}]])
+def admin_broadcast_kb(): return kb([[{"text":"👥 Все согласившиеся"}],[{"text":"🔔 С подпиской"}],[{"text":"📦 Покупатели"}],[{"text":"🆕 Новые сегодня"}],[{"text":"🔙 Админ-панель"}]])
+def admin_notification_kb(s): return kb([[{"text":("🟢 Новые заказы" if s["new_order"] else "⚪ Новые заказы")}],[{"text":("🟢 Изменение статуса" if s["status_change"] else "⚪ Изменение статуса")}],[{"text":("🟢 Новые пользователи" if s["new_user"] else "⚪ Новые пользователи")}],[{"text":("🟢 Безопасность" if s["security"] else "⚪ Безопасность")}],[{"text":"🔙 Админ-панель"}]])
+
+async def admin_show_analytics(chat_id,days=None):
+    a=get_analytics(days); label="всё время" if not days else ("сегодня" if days==1 else f"за {days} дней")
+    await send(chat_id,f"📊 <b>Аналитика — {label}</b>\n\n👥 Пользователей: <b>{a['users']}</b>\n🆕 Новых сегодня: <b>{a['new_today']}</b>\n✅ Согласие ПДн: <b>{a['consented']}</b>\n\n📦 Заказов: <b>{a['orders']}</b>\n🆕 Новых: <b>{a['new_orders']}</b>\n✅ Подтверждено: <b>{a['confirmed']}</b>\n🔧 В сборке: <b>{a['assembling']}</b>\n📦 Готово: <b>{a['ready']}</b>\n🚚 В доставке: <b>{a['shipping']}</b>\n✅ Завершено: <b>{a['completed']}</b>\n❌ Отклонено: <b>{a['rejected']}</b>\n\n🔔 Уведомлений: <b>{a['subscriptions']}</b>\n⭐ Отзывов: <b>{a['reviews']}</b>\n⭐ Средняя оценка: <b>{a['avg_rating']:.2f}</b>\n🔥 Популярный товар: <b>{esc(a['top_product'] or 'нет данных')}</b>",admin_analytics_kb())
+
+async def admin_users_menu(chat_id): await send(chat_id,"👥 <b>Пользователи</b>\n\nВыберите действие:",admin_users_kb())
+async def admin_users_latest(chat_id):
+    us=get_all_users(20)
+    rows=[]
+    for u in us: rows.append([{"text":f"{u.get('username') or u.get('name') or u['telegram_id']} · {u['telegram_id']}"}])
+    rows.append([{"text":"🔎 Найти пользователя"},{"text":"🔙 Пользователи"}]); await send(chat_id,"👥 <b>Последние пользователи</b>",kb(rows))
+async def admin_user_card(chat_id,uid):
+    c=get_user_admin_card(uid)
+    if not c: await send(chat_id,"Пользователь не найден.",admin_users_kb()); return
+    u=c['user']; orders=c['orders']; g={"male":"мужчина","female":"женщина","other":"не указано"}.get(u.get('gender'),"не указано")
+    txt=f"👤 <b>Пользователь {uid}</b>\n\nTelegram: <b>@{esc(u.get('username') or 'нет')}</b>\nИмя: <b>{esc(u.get('name') or 'не указано')}</b>\nПол: <b>{g}</b>\nДата рождения: <b>{esc(u.get('birthdate') or 'не указана')}</b>\nТелефон: <b>{esc(u.get('phone') or 'не указан')}</b>\nСогласие: <b>{'да' if u.get('consent_given') else 'нет'}</b>\nЗаказов: <b>{len(orders)}</b>"
+    if orders:
+        txt += "\n\n" + "\n".join([f"№{o['id']} · {esc(o['product_name'])} · {status_text(o['status'])}" for o in orders[:10]])
+    await send(chat_id,txt,admin_users_kb())
+async def admin_audit_view(chat_id):
+    rows=get_admin_audit(30)
+    if not rows: await send(chat_id,"🛡 Журнал пока пуст.",admin_kb()); return
+    lines=["🛡 <b>Журнал действий</b>"]
+    for r in rows:
+        dt=r[6].astimezone(MOSCOW_TZ).strftime('%d.%m %H:%M'); lines.append(f"{dt} · <b>{esc(r[2])}</b> · {esc(r[3] or '')} {esc(r[4] or '')}\n{esc(r[5] or '')}")
+    await send(chat_id,"\n\n".join(lines),admin_kb())
+async def admin_notifications_view(chat_id): await send(chat_id,"🚨 <b>Уведомления администратора</b>\n\nНастройте события:",admin_notification_kb(get_admin_settings()))
+
 async def admin_orders(chat_id):
     os_=get_recent_orders(20)
     if not os_: await send(chat_id,"Заказов пока нет.",admin_kb()); return
@@ -368,6 +405,29 @@ async def handle_state(chat_id, text, state, message):
             await send(chat_id,f"🧾 <b>Проверьте заказ</b>\n\n💎 {esc(p['name'])}\n💰 {price} ₽\n👤 {esc(name)}\n📞 {esc(phone)}\n\nВсё верно?",order_confirm_kb()); return
         await show_product(chat_id,get_product(state["product_id"]))
         return
+    if t=="admin_find_user":
+        rs=search_users(text,20)
+        if not rs: await send(chat_id,"Пользователь не найден.",admin_users_kb()); return
+        rows=[]
+        for u in rs: rows.append([{ "text":f"{u.get('username') or u.get('name') or u['telegram_id']} · {u['telegram_id']}" }])
+        rows.append([{ "text":"🔙 Пользователи" }]); user_states[chat_id]={"type":"admin_find_results","results":{str(u['telegram_id']):u for u in rs}}; await send(chat_id,"👥 <b>Результаты</b>",kb(rows)); return
+    if t=="admin_find_results":
+        found=None
+        for u in state.get("results",{}).values():
+            label=f"{u.get('username') or u.get('name') or u['telegram_id']} · {u['telegram_id']}"
+            if text==label: found=u; break
+        if not found: await send(chat_id,"Выберите пользователя.",back_kb()); return
+        user_states.pop(chat_id,None); await admin_user_card(chat_id,found['telegram_id']); return
+    if t=="admin_broadcast_audience":
+        mp={"👥 Все согласившиеся":"all","🔔 С подпиской":"subscribed","📦 Покупатели":"buyers","🆕 Новые сегодня":"new_today"}
+        if text not in mp: await send(chat_id,"Выберите аудиторию.",admin_broadcast_kb()); return
+        user_states[chat_id]={"type":"admin_broadcast_text","audience":mp[text]}; await send(chat_id,"Введите текст рассылки. /cancel — отмена",back_kb()); return
+    if t=="admin_broadcast_text":
+        recipients=get_broadcast_recipients(state['audience']); sent_count=0; failed=0
+        for uid in recipients:
+            try: await send(uid,text,main_kb()); sent_count+=1; await asyncio.sleep(.05)
+            except Exception: failed+=1
+        add_admin_audit(chat_id,"broadcast","users",state['audience'],f"sent={sent_count}; failed={failed}"); user_states.pop(chat_id,None); await send(chat_id,f"📣 Рассылка завершена.\nОтправлено: {sent_count}\nОшибок: {failed}",admin_kb()); return
     if t=="admin_selected_product":
         p=get_product(state["product_id"])
         if not p:
@@ -380,6 +440,10 @@ async def handle_state(chat_id, text, state, message):
             user_states[chat_id]={"type":"admin_edit_description","product_id":p["id"]}; await send(chat_id,"Введите новое описание:",back_kb()); return
         if text=="💰 Изменить цену":
             user_states[chat_id]={"type":"admin_edit_price","product_id":p["id"]}; await send(chat_id,"Введите новую цену:",back_kb()); return
+        if text=="🖼 Изменить изображение":
+            user_states[chat_id]={"type":"admin_edit_image","product_id":p["id"]}; await send(chat_id,"Введите имя файла из static/images или - чтобы убрать.",back_kb()); return
+        if text=="🖼 Изменить изображение":
+            user_states[chat_id]={"type":"admin_edit_image","product_id":p["id"]}; await send(chat_id,"Введите имя файла из static/images, например <b>dzi_9.png</b>, или - чтобы убрать:",back_kb()); return
         if text in {"⏸ Скрыть товар","▶️ Показать товар"}:
             set_product_active(p["id"],not p["is_active"]); await admin_product(chat_id,get_product(p["id"])); return
         if text == "🗑 Удалить товар":
@@ -427,6 +491,13 @@ async def handle_state(chat_id, text, state, message):
     if t=="notification_custom_time":
         if not valid_time(text): await send(chat_id,"Неверное время. Пример: 09:30",back_kb()); return
         set_subscription(chat_id,text,True); user_states.pop(chat_id,None); await send(chat_id,f"🔔 Уведомления включены на {text} по Москве.",main_kb()); return
+    if t=="gift_prediction_username":
+        username=text.strip()
+        if not username.startswith("@") or len(username)>33: await send(chat_id,"Введите логин в формате @username.",back_kb()); return
+        recipient=get_user_by_username(username)
+        if not recipient: user_states.pop(chat_id,None); await send(chat_id,"Пользователь не найден или ещё не запускал бота.",main_kb()); return
+        if recipient['telegram_id']==chat_id: await send(chat_id,"Нельзя отправить подарок самому себе.",back_kb()); return
+        user_states.pop(chat_id,None); await ai_processing(chat_id,"daily"); pred=get_random_prediction(); await send(recipient['telegram_id'],"🎁 <b>Вам подарили предсказание!</b>\n\n"+pred,main_kb()); await send(chat_id,f"✅ Предсказание отправлено <b>{esc(username)}</b>.",main_kb()); return
     if t=="order_name":
         if not text: await send(chat_id,"Введите имя:",back_kb()); return
         user_states[chat_id]={"type":"order_phone","product_id":state["product_id"],"name":text[:50]}; await send(chat_id,"Теперь укажите номер телефона для связи.",phone_kb()); return
@@ -441,9 +512,11 @@ async def handle_state(chat_id, text, state, message):
         user_states[chat_id]={"type":"order_confirm","product_id":state["product_id"],"name":state["name"],"phone":text}; p=get_product(state["product_id"]); price=f"{p['price_rub']:,}".replace(","," "); await send(chat_id,f"🧾 <b>Проверьте заказ</b>\n\n💎 {esc(p['name'])}\n💰 {price} ₽\n👤 {esc(state['name'])}\n📞 {esc(text)}\n\nВсё верно?",order_confirm_kb()); return
     if t=="order_confirm":
         if text!="✅ Подтвердить заказ": user_states.pop(chat_id,None); await send(chat_id,"Заказ отменён.",main_kb()); return
-        oid=create_order(chat_id,state["product_id"],state["name"],state["phone"]); update_user_field(chat_id,"phone",state["phone"]); p=get_product(state["product_id"]); user_states.pop(chat_id,None)
+        oid=create_order(chat_id,state["product_id"],state["name"],state["phone"]); add_admin_audit(ADMIN_ID,"new_order","order",oid,f"user={chat_id}"); update_user_field(chat_id,"phone",state["phone"]); p=get_product(state["product_id"]); user_states.pop(chat_id,None)
         await send(chat_id,f"🙏 <b>Спасибо за ваш заказ!</b>\n\nЗаказ №{oid} на браслет «{esc(p['name'])}» принят.\n\nЗаказ передан менеджеру, и скоро приступят к сборке браслета. Менеджер свяжется с вами для подтверждения.",main_kb())
-        await send(ADMIN_ID,f"🆕 <b>Новый заказ №{oid}</b>\n\n💎 {esc(p['name'])}\n👤 {esc(state['name'])}\n📞 {esc(state['phone'])}\n🆔 {chat_id}",admin_kb()); return
+        if get_admin_settings()["new_order"]:
+            await send(ADMIN_ID,f"🆕 <b>Новый заказ №{oid}</b>\n\n💎 {esc(p['name'])}\n👤 {esc(state['name'])}\n📞 {esc(state['phone'])}\n🆔 {chat_id}",admin_kb())
+        return
     if t=="account_edit_name":
         if text=="🔙 Личный кабинет": user_states.pop(chat_id,None); await show_account(chat_id); return
         update_user_field(chat_id,"name",text[:50]); user_states.pop(chat_id,None); await show_account(chat_id); return
@@ -472,17 +545,15 @@ async def handle_state(chat_id, text, state, message):
         if text=="🔙 К списку заказов": user_states.pop(chat_id,None); await admin_orders(chat_id); return
         o=get_order(state["order_id"])
         if not o: user_states.pop(chat_id,None); await send(chat_id,"Заказ не найден.",admin_kb()); return
-        if text not in {"✅ Подтвердить","❌ Отклонить","📦 Завершить"}:
+        if text not in {"✅ Подтвердить","❌ Отклонить","🔧 В сборке","📦 Готов","🚚 В доставке","✅ Завершить"}:
             await send(chat_id,"Выберите действие.",admin_order_kb())
             return
-        status = {
-            "✅ Подтвердить": "confirmed",
-            "❌ Отклонить": "rejected",
-            "📦 Завершить": "completed",
-        }[text]
+        status = {"✅ Подтвердить":"confirmed","❌ Отклонить":"rejected","🔧 В сборке":"assembling","📦 Готов":"ready","🚚 В доставке":"shipping","✅ Завершить":"completed"}[text]
         set_order_status(o["id"], status)
         user_states.pop(chat_id, None)
-        await send(o["telegram_id"], f"{status_text(status)} Заказ №{o['id']}.", main_kb())
+        add_admin_audit(chat_id,"order_status","order",o["id"],status)
+        if get_admin_settings()["status_change"]:
+            await send(o["telegram_id"], f"📦 <b>Статус заказа №{o['id']}</b>\n\n{status_text(status)}", main_kb())
         await send(chat_id, f"Статус заказа №{o['id']} изменён: {status_text(status)}", admin_kb())
         return
     if t=="admin_add_name":
@@ -493,6 +564,17 @@ async def handle_state(chat_id, text, state, message):
         try: price=int(text.replace(" ","")); assert 0<=price<=10000000
         except Exception: await send(chat_id,"Введите целую цену от 0 до 10 000 000.",back_kb()); return
         add_product(state["name"],state["description"],price); user_states.pop(chat_id,None); await send(chat_id,"✅ Товар добавлен.",admin_kb()); return
+    if t=="admin_edit_image":
+        value=text.strip()
+        if value=="-": value=None
+        elif not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}",value) or not (IMAGES_DIR/value).exists():
+            await send(chat_id,"Файл не найден в static/images.",back_kb()); return
+        update_product_image(state["product_id"],value); add_admin_audit(chat_id,"product_image","product",state["product_id"],str(value)); user_states.pop(chat_id,None); await admin_product(chat_id,get_product(state["product_id"])); return
+    if t=="admin_edit_image":
+        value=text.strip()
+        if value=="-": value=None
+        elif not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}",value) or not (IMAGES_DIR/value).exists(): await send(chat_id,"Файл не найден.",back_kb()); return
+        update_product_image(state['product_id'],value); add_admin_audit(chat_id,"product_image","product",state['product_id'],str(value)); user_states.pop(chat_id,None); await admin_product(chat_id,get_product(state['product_id'])); return
     if t.startswith("admin_edit_"):
         field=t.replace("admin_edit_","")
         value=text
@@ -517,13 +599,37 @@ async def show_magic8(chat_id):
 async def process_update(update):
     if "message" not in update: return
     m=update["message"]; chat_id=int(m["chat"]["id"]); text=(m.get("text") or "").strip()
+    sender=m.get("from") or {}; uname=(sender.get("username") or "").strip().lstrip("@").lower()
+    if uname:
+        try: update_username(chat_id,uname)
+        except Exception: pass
     if len(text) > 1000:
         await send(chat_id,"Сообщение слишком длинное.",main_kb()); return
     if chat_id != ADMIN_ID and text and is_bad(text):
+        if get_admin_settings()["security"]:
+            try:
+                await send(ADMIN_ID, f"🚨 <b>Модерация</b>\n\nПользователь: {chat_id}", admin_kb())
+                add_admin_audit(ADMIN_ID, "moderation", "security", chat_id, "blocked message")
+            except Exception:
+                pass
         await send(chat_id,"Пожалуйста, общайтесь уважительно. Оскорбительные и нецензурные сообщения не обрабатываются.",main_kb()); return
-    if not flood_ok(chat_id): return
+    if not flood_ok(chat_id):
+        if chat_id != ADMIN_ID and get_admin_settings()["security"]:
+            try:
+                await send(ADMIN_ID, f"🚨 <b>Антиспам</b>\n\nПользователь: {chat_id}", admin_kb())
+                add_admin_audit(ADMIN_ID, "flood", "security", chat_id, "rate limit")
+            except Exception:
+                pass
+        return
+    existed=get_user(chat_id)
     ensure_user(chat_id)
     u=get_user(chat_id)
+    if existed is None and chat_id != ADMIN_ID and get_admin_settings()["new_user"]:
+        try:
+            await send(ADMIN_ID, f"👤 <b>Новый пользователь</b>\n\n🆔 {chat_id}", admin_kb())
+            add_admin_audit(ADMIN_ID, "new_user", "user", chat_id, "")
+        except Exception:
+            pass
     state=user_states.get(chat_id)
 
     # /start is always a safe reset command once consent has been granted.
@@ -579,6 +685,7 @@ async def process_update(update):
     if text=="🎁 Подарок другу":
         await send(chat_id,"🎁 <b>Подарок другу</b>\n\nВыберите подарок:",kb([[{"text":"🔮 Подарить предсказание"}],[{"text":"💎 Подарить браслет"}],[{"text":"🔙 Главное меню"}]])); return
     if text=="🔮 Подарить предсказание":
+        user_states[chat_id]={"type":"gift_prediction_username"}; await send(chat_id,"🎁 <b>Подарить предсказание</b>\n\nВведите Telegram-логин получателя в формате <b>@username</b>.",back_kb()); return
         await ai_processing(chat_id,"daily"); await send(chat_id,"🎁 <b>Предсказание для друга</b>\n\n"+get_random_prediction()+"\n\nПерешлите это сообщение другу.",main_kb()); return
     if text=="💎 Подарить браслет": await show_catalog(chat_id); return
     if text=="🔙 К каталогу": await show_catalog(chat_id); return
@@ -631,38 +738,35 @@ async def process_update(update):
         rows=get_recent_reviews(20); mine=[r for r in rows if r[2]==chat_id]
         await send(chat_id,"⭐ У вас пока нет отзывов." if not mine else "\n\n".join([f"⭐ {r[3]}/5\n{esc(r[4] or 'Без текста')}" for r in mine]),account_kb()); return
     if chat_id==ADMIN_ID:
-        if text=="📊 Статистика":
-            s=get_stats(); await send(chat_id,f"📊 <b>Статистика</b>\n\nПользователей: {s['users']}\nУведомлений: {s['subscriptions']}\nТоваров: {s['products']}\nЗаказов: {s['orders']}\nНовых: {s['new_orders']}\nПодтверждённых: {s['confirmed']}\nОтклонённых: {s['rejected']}",admin_kb()); return
+        if text=="📊 Аналитика": await admin_show_analytics(chat_id,None); return
+        if text=="Сегодня": await admin_show_analytics(chat_id,1); return
+        if text=="7 дней": await admin_show_analytics(chat_id,7); return
+        if text=="30 дней": await admin_show_analytics(chat_id,30); return
+        if text=="Всё время": await admin_show_analytics(chat_id,None); return
         if text=="📦 Заказы": await admin_orders(chat_id); return
         if text.startswith("Заказ №"):
             try: await admin_order(chat_id,int(text.split("№",1)[1].split(" ",1)[0]))
             except Exception: await send(chat_id,"Некорректный номер заказа.",admin_kb())
             return
         if text=="🔙 К списку заказов": await admin_orders(chat_id); return
+        if text=="👥 Пользователи": await admin_users_menu(chat_id); return
+        if text=="👥 Последние пользователи": await admin_users_latest(chat_id); return
+        if text=="🔎 Найти пользователя": user_states[chat_id]={"type":"admin_find_user"}; await send(chat_id,"Введите Telegram ID, @username, имя, телефон или дату рождения:",back_kb()); return
+        if text=="🔙 Пользователи": await admin_users_menu(chat_id); return
         if text=="🛍 Каталог": await admin_catalog(chat_id); return
         if text=="➕ Добавить товар": user_states[chat_id]={"type":"admin_add_name"}; await send(chat_id,"Введите название товара:",back_kb()); return
         if text=="🔙 Каталог админа": await admin_catalog(chat_id); return
         for p in get_products(False):
             if text in {"🟢 "+p["name"],"⚪ "+p["name"]}: user_states[chat_id]={"type":"admin_selected_product","product_id":p["id"]}; await admin_product(chat_id,p); return
-        if text=="✏️ Изменить название": return
-        if text=="📝 Изменить описание": return
-        if text=="💰 Изменить цену": return
-        if text in {"⏸ Скрыть товар","▶️ Показать товар"}: return
-        if text=="🔙 Админ-панель": await send(chat_id,"👑 <b>Админ-панель</b>",admin_kb()); return
+        if text=="📣 Рассылка": user_states[chat_id]={"type":"admin_broadcast_audience"}; await send(chat_id,"📣 <b>Выберите аудиторию</b>",admin_broadcast_kb()); return
+        if text=="🚨 Уведомления": await admin_notifications_view(chat_id); return
+        if text in {"🟢 Новые заказы","⚪ Новые заказы","🟢 Изменение статуса","⚪ Изменение статуса","🟢 Новые пользователи","⚪ Новые пользователи","🟢 Безопасность","⚪ Безопасность"}:
+            s=get_admin_settings(); mp={"🟢 Новые заказы":"new_order","⚪ Новые заказы":"new_order","🟢 Изменение статуса":"status_change","⚪ Изменение статуса":"status_change","🟢 Новые пользователи":"new_user","⚪ Новые пользователи":"new_user","🟢 Безопасность":"security","⚪ Безопасность":"security"}; key=mp[text]; set_admin_notifications(key,not s[key]); add_admin_audit(chat_id,"notification_setting","admin",1,f"{key}={not s[key]}"); await admin_notifications_view(chat_id); return
+        if text=="🛡 Журнал": await admin_audit_view(chat_id); return
         if text=="⭐ Отзывы":
-            rows = get_recent_reviews(20)
-            if not rows:
-                await send(chat_id, "⭐ Отзывов пока нет.", admin_kb())
-                return
-            lines = ["⭐ <b>Последние отзывы</b>"]
-            for r in rows:
-                lines.append(f"\nЗаказ №{r[1]} · {r[3]}/5\n{esc(r[4] or 'Без текста')}")
-            await send(chat_id, "\n".join(lines), admin_kb())
-            return
-        if text=="👥 Пользователи":
-            us=get_all_users(30); await send(chat_id,"\n".join(["👥 <b>Пользователи</b>"]+[f"🆔 {u['telegram_id']} — {esc(u['name'] or 'без имени')}" for u in us]) if us else "Пользователей пока нет.",admin_kb()); return
-        if text=="🔔 Уведомления": await send(chat_id,f"🔔 Активных уведомлений: <b>{len(get_active_subscriptions())}</b>",admin_kb()); return
-        if text=="📣 Рассылка": user_states[chat_id]={"type":"admin_broadcast"}; await send(chat_id,"Введите текст рассылки. Для отмены /cancel",back_kb()); return
+            rows=get_recent_reviews(20)
+            if not rows: await send(chat_id,"⭐ Отзывов пока нет.",admin_kb()); return
+            await send(chat_id,"\n\n".join([f"Заказ №{r[1]} · {r[3]}/5\n{esc(r[4] or 'Без текста')}" for r in rows]),admin_kb()); return
         if text=="🚪 Выйти": await send(chat_id,"Вы вышли из админ-панели.",main_kb()); return
     await send(chat_id,"Используйте кнопки меню.",main_kb())
 
