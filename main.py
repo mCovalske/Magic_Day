@@ -1,4 +1,4 @@
-# BUILD: PREDBOT-2026-08-17-LOCKFIX-02
+# BUILD: PREDBOT-2026-08-18-STARTFIX-01
 import asyncio
 import html
 import os
@@ -54,6 +54,12 @@ def main_kb():
         [{"text": "🔔 Уведомления"}, {"text": "👤 Личный кабинет"}],
     ])
 
+
+def consent_kb():
+    return kb([
+        [{"text": "✅ Я согласен(на)"}],
+        [{"text": "❌ Не согласен(на)"}],
+    ])
 
 def back_kb(): return kb([[{"text": "🔙 Главное меню"}]])
 def gender_kb(): return kb([[{"text": "👨 Мужчина"}, {"text": "👩 Женщина"}], [{"text": "🙂 Не хочу указывать"}], [{"text": "🔙 Главное меню"}]], True)
