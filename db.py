@@ -186,6 +186,49 @@ def init_db():
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS daily_predictions (
+                    id BIGSERIAL PRIMARY KEY,
+                    text TEXT NOT NULL,
+                    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS magic8_answers (
+                    id BIGSERIAL PRIMARY KEY,
+                    text TEXT NOT NULL,
+                    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS legal_documents (
+                    id BIGSERIAL PRIMARY KEY,
+                    doc_key TEXT UNIQUE NOT NULL,
+                    title TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    version TEXT NOT NULL DEFAULT '1.0',
+                    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS backup_log (
+                    id BIGSERIAL PRIMARY KEY,
+                    admin_id BIGINT NOT NULL,
+                    backup_type TEXT NOT NULL,
+                    file_name TEXT,
+                    status TEXT NOT NULL,
+                    details TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            seed_stage2_content(cur)
             cur.execute("INSERT INTO admin_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
             seed_products(cur)
         conn.commit()
@@ -216,6 +259,138 @@ def seed_products(cur):
                 sort_order = EXCLUDED.sort_order,
                 updated_at = CURRENT_TIMESTAMP
         """, (name, description, price, image_file, sort_order))
+
+
+
+def seed_stage2_content(cur):
+    cur.execute("SELECT COUNT(*) FROM daily_predictions")
+    if cur.fetchone()[0] == 0:
+        try:
+            from predictions import PREDICTIONS
+        except Exception:
+            PREDICTIONS=[]
+        for i,text in enumerate(PREDICTIONS,1):
+            cur.execute("INSERT INTO daily_predictions(text,sort_order) VALUES(%s,%s)",(text,i))
+    cur.execute("SELECT COUNT(*) FROM magic8_answers")
+    if cur.fetchone()[0] == 0:
+        answers=["Да.","Определённо да!","Без сомнений.","Скорее да, чем нет.","Пока не ясно, попробуйте позже.","Скорее нет, чем да.","Нет.","Определённо нет.","Даже не думайте.","Мой ответ — нет."]
+        for i,text in enumerate(answers,1): cur.execute("INSERT INTO magic8_answers(text,sort_order) VALUES(%s,%s)",(text,i))
+    cur.execute("SELECT COUNT(*) FROM legal_documents")
+    if cur.fetchone()[0] == 0:
+        docs=[
+            ("policy","Политика ПДн","/legal/01_policy_personal_data.html"),("consent","Согласие ПДн","/legal/02_consent_personal_data.html"),
+            ("confidentiality","Конфиденциальность","/legal/03_confidentiality_security.html"),("agreement","Пользовательское соглашение","/legal/04_user_agreement.html"),
+            ("offer","Публичная оферта","/legal/05_public_offer.html"),("disclaimer","Дисклеймер","/legal/06_disclaimer_predictions.html"),
+            ("marketing","Рекламное согласие","/legal/07_marketing_consent.html"),("rights","Права субъекта ПДн","/legal/08_data_subject_requests.html")]
+        for key,title,url in docs: cur.execute("INSERT INTO legal_documents(doc_key,title,url) VALUES(%s,%s,%s)",(key,title,url))
+
+def get_daily_predictions(active_only=True):
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur:
+            sql="SELECT id,text,is_active,sort_order FROM daily_predictions" + (" WHERE is_active=TRUE" if active_only else "") + " ORDER BY sort_order,id"
+            cur.execute(sql); rows=cur.fetchall()
+        return [{"id":r[0],"text":r[1],"is_active":bool(r[2]),"sort_order":r[3]} for r in rows]
+    finally: conn.close()
+
+def get_random_daily_prediction():
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT text FROM daily_predictions WHERE is_active=TRUE ORDER BY RANDOM() LIMIT 1")
+            r=cur.fetchone(); return r[0] if r else None
+    finally: conn.close()
+
+def add_daily_prediction(text):
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COALESCE(MAX(sort_order),0)+1 FROM daily_predictions"); order=cur.fetchone()[0]
+            cur.execute("INSERT INTO daily_predictions(text,sort_order) VALUES(%s,%s) RETURNING id",(text,order)); pid=cur.fetchone()[0]
+        conn.commit(); return pid
+    finally: conn.close()
+
+def update_daily_prediction(pid,text):
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur: cur.execute("UPDATE daily_predictions SET text=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s",(text,pid))
+        conn.commit()
+    finally: conn.close()
+
+def set_daily_prediction_active(pid,active):
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur: cur.execute("UPDATE daily_predictions SET is_active=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s",(active,pid))
+        conn.commit()
+    finally: conn.close()
+
+def delete_daily_prediction(pid):
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur: cur.execute("DELETE FROM daily_predictions WHERE id=%s",(pid,)); deleted=cur.rowcount>0
+        conn.commit(); return deleted
+    finally: conn.close()
+
+def get_magic8_answers(active_only=True):
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur:
+            sql="SELECT id,text,is_active,sort_order FROM magic8_answers" + (" WHERE is_active=TRUE" if active_only else "") + " ORDER BY sort_order,id"
+            cur.execute(sql); rows=cur.fetchall()
+        return [{"id":r[0],"text":r[1],"is_active":bool(r[2]),"sort_order":r[3]} for r in rows]
+    finally: conn.close()
+
+def get_random_magic8_answer():
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT text FROM magic8_answers WHERE is_active=TRUE ORDER BY RANDOM() LIMIT 1"); r=cur.fetchone(); return r[0] if r else "Пока не ясно."
+    finally: conn.close()
+
+def add_magic8_answer(text):
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COALESCE(MAX(sort_order),0)+1 FROM magic8_answers"); order=cur.fetchone()[0]
+            cur.execute("INSERT INTO magic8_answers(text,sort_order) VALUES(%s,%s) RETURNING id",(text,order)); pid=cur.fetchone()[0]
+        conn.commit(); return pid
+    finally: conn.close()
+
+def update_magic8_answer(pid,text):
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur: cur.execute("UPDATE magic8_answers SET text=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s",(text,pid))
+        conn.commit()
+    finally: conn.close()
+
+def set_magic8_active(pid,active):
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur: cur.execute("UPDATE magic8_answers SET is_active=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s",(active,pid))
+        conn.commit()
+    finally: conn.close()
+
+def get_legal_documents():
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT doc_key,title,url,version,is_active,updated_at FROM legal_documents ORDER BY id"); rows=cur.fetchall()
+        return [{"key":r[0],"title":r[1],"url":r[2],"version":r[3],"active":bool(r[4]),"updated_at":r[5]} for r in rows]
+    finally: conn.close()
+
+def log_backup(admin_id,backup_type,file_name,status,details=""):
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur: cur.execute("INSERT INTO backup_log(admin_id,backup_type,file_name,status,details) VALUES(%s,%s,%s,%s,%s)",(admin_id,backup_type,file_name,status,details[:2000]))
+        conn.commit()
+    finally: conn.close()
+
+def get_last_backup():
+    conn=get_conn()
+    try:
+        with conn.cursor() as cur: cur.execute("SELECT backup_type,file_name,status,details,created_at FROM backup_log ORDER BY created_at DESC LIMIT 1"); r=cur.fetchone()
+        return None if not r else {"type":r[0],"file":r[1],"status":r[2],"details":r[3],"created_at":r[4]}
+    finally: conn.close()
 
 
 def ensure_user(telegram_id: int):
