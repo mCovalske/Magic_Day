@@ -1,8 +1,11 @@
-# BUILD: PREDBOT-2026-08-18-ID-ACCESS-RESET-01
+# BUILD: PREDBOT-2026-08-19-ADMIN-STAGE2-01
 import asyncio
 import html
 import os
 import re
+import csv
+import subprocess
+import shutil as file_shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -19,6 +22,9 @@ from db import (
     get_user_by_username, update_username,
     get_stats, get_subscription, get_user, get_user_orders, init_db, set_order_status,
     get_analytics, search_users, get_user_admin_card, get_admin_audit, add_admin_audit,
+    get_daily_predictions, get_random_daily_prediction, add_daily_prediction, update_daily_prediction, set_daily_prediction_active, delete_daily_prediction,
+    get_magic8_answers, get_random_magic8_answer, add_magic8_answer, update_magic8_answer, set_magic8_active,
+    get_legal_documents, log_backup, get_last_backup,
     get_admin_settings, set_admin_notifications, get_broadcast_recipients, update_product_image,
     set_product_active, set_subscription, update_product, update_user_field,
 )
@@ -148,7 +154,15 @@ def time_kb():
 
 
 def admin_kb():
-    return kb([[{"text":"📊 Аналитика"},{"text":"📦 Заказы"}],[{"text":"👥 Пользователи"},{"text":"🛍 Каталог"}],[{"text":"📣 Рассылка"},{"text":"🚨 Уведомления"}],[{"text":"🛡 Журнал"},{"text":"⭐ Отзывы"}],[{"text":"🚪 Выйти"}]])
+    return kb([
+        [{"text":"📊 Аналитика"},{"text":"📦 Заказы"}],
+        [{"text":"👥 Пользователи"},{"text":"🛍 Каталог"}],
+        [{"text":"📝 Контент"},{"text":"🎱 Magic 8"}],
+        [{"text":"⚖️ Документы"},{"text":"📤 Экспорт"}],
+        [{"text":"💾 Резервная копия"},{"text":"🚨 Уведомления"}],
+        [{"text":"🛡 Журнал"},{"text":"⭐ Отзывы"}],
+        [{"text":"🚪 Выйти"}],
+    ])
 def admin_order_kb():
     return kb([[{"text":"✅ Подтвердить"},{"text":"❌ Отклонить"}],[{"text":"🔧 В сборке"},{"text":"📦 Готов"}],[{"text":"🚚 В доставке"},{"text":"✅ Завершить"}],[{"text":"🔙 К списку заказов"}]])
 def admin_product_kb(active): return kb([[{"text":"✏️ Изменить название"}],[{"text":"📝 Изменить описание"}],[{"text":"💰 Изменить цену"}],[{"text":"⏸ Скрыть товар" if active else "▶️ Показать товар"}],[{"text":"🗑 Удалить товар"}],[{"text":"🔙 Каталог админа"}]])
@@ -348,6 +362,85 @@ async def show_notifications(chat_id):
     else:
         await send(chat_id,"🔔 <b>Ежедневные уведомления</b>\n\nЯ буду сообщать: «Ваше предсказание на день готово — узнайте, что вас ждёт». Выберите удобное время.",notifications_kb(False))
 
+
+def admin_content_kb(): return kb([[{"text":"🔮 Дневные прогнозы"}],[{"text":"🔙 Админ-панель"}]])
+def admin_magic_kb(): return kb([[{"text":"🎱 Ответы шара"}],[{"text":"➕ Добавить ответ"}],[{"text":"🔙 Админ-панель"}]])
+def admin_export_kb(): return kb([[{"text":"👥 Пользователи CSV"}],[{"text":"📦 Заказы CSV"}],[{"text":"⭐ Отзывы CSV"}],[{"text":"🔙 Админ-панель"}]])
+def admin_backup_kb(): return kb([[{"text":"💾 Сделать резервную копию"}],[{"text":"📋 Последняя копия"}],[{"text":"🔙 Админ-панель"}]])
+
+aasync=0
+
+async def admin_content_menu(chat_id): await send(chat_id,"📝 <b>Управление контентом</b>",admin_content_kb())
+
+async def admin_predictions_menu(chat_id):
+    user_states[chat_id]={"type":"admin_prediction_list"}
+    items=get_daily_predictions(False); rows=[]
+    for p in items: rows.append([{"text":f"{'🟢' if p['is_active'] else '⚪'} #{p['id']} {p['text'][:42]}"}])
+    rows.append([{"text":"➕ Добавить прогноз"}]); rows.append([{"text":"🔙 Контент"}])
+    await send(chat_id,f"🔮 <b>Дневные прогнозы</b>\nВсего: {len(items)}",kb(rows))
+
+async def admin_magic_menu(chat_id):
+    user_states[chat_id]={"type":"admin_magic_list"}
+    items=get_magic8_answers(False); rows=[]
+    for p in items: rows.append([{"text":f"{'🟢' if p['is_active'] else '⚪'} #{p['id']} {p['text'][:42]}"}])
+    rows.append([{"text":"➕ Добавить ответ"}]); rows.append([{"text":"🔙 Админ-панель"}])
+    await send(chat_id,f"🎱 <b>Magic 8</b>\nОтветов: {len(items)}",kb(rows))
+
+async def admin_documents_view(chat_id):
+    docs=get_legal_documents(); lines=["⚖️ <b>Документы</b>"]
+    for d in docs: lines.append(f"\n{'🟢' if d['active'] else '⚪'} <b>{esc(d['title'])}</b>\nВерсия: {esc(d['version'])}\n{esc((PUBLIC_URL or '')+d['url'])}")
+    await send(chat_id,"\n".join(lines),kb([[{"text":"🔙 Админ-панель"}]]))
+
+async def send_document_file(chat_id,path,caption=None):
+    form=aiohttp.FormData(); form.add_field("chat_id",str(chat_id))
+    with Path(path).open("rb") as fh:
+        form.add_field("document",fh,filename=Path(path).name,content_type="application/octet-stream")
+        if caption: form.add_field("caption",caption)
+        async with telegram_session.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",data=form,timeout=60) as resp:
+            data=await resp.json(content_type=None)
+            if resp.status!=200 or not data.get("ok"): raise RuntimeError(f"Telegram sendDocument: {resp.status} {data}")
+
+async def export_csv(chat_id,kind):
+    export_dir=BASE_DIR/"exports"; export_dir.mkdir(exist_ok=True)
+    if kind=="users":
+        filename="users.csv"; headers=["telegram_id","username","name","gender","birthdate","phone","consent_given","created_at"]
+        rows=get_all_users(10000); data=[[u.get('telegram_id'),u.get('username',''),u.get('name',''),u.get('gender',''),u.get('birthdate',''),u.get('phone',''),u.get('consent_given'),u.get('created_at')] for u in rows]
+    elif kind=="orders":
+        filename="orders.csv"; headers=["id","telegram_id","product","customer_name","customer_phone","status","created_at"]
+        rows=get_recent_orders(100000); data=[[o['id'],o['telegram_id'],o['product_name'],o['customer_name'],o['customer_phone'],o['status'],o['created_at']] for o in rows]
+    else:
+        filename="reviews.csv"; headers=["id","order_id","telegram_id","rating","review_text","created_at"]
+        data=get_recent_reviews(100000)
+    path=export_dir/filename
+    with path.open('w',encoding='utf-8-sig',newline='') as fh:
+        w=csv.writer(fh); w.writerow(headers); w.writerows(data)
+    await send_document_file(chat_id,path,f"📤 {filename}")
+    add_admin_audit(chat_id,"export",kind,filename,f"rows={len(data)}")
+    await send(chat_id,"✅ Экспорт готов.",admin_export_kb())
+
+async def backup_status(chat_id):
+    b=get_last_backup()
+    if not b: await send(chat_id,"💾 Резервных копий пока нет.",admin_backup_kb()); return
+    dt=b['created_at'].astimezone(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M')
+    await send(chat_id,f"💾 <b>Последняя копия</b>\nСтатус: {esc(b['status'])}\nФайл: {esc(b['file'] or '—')}\nВремя: {dt}\n{esc(b['details'] or '')}",admin_backup_kb())
+
+async def make_backup(chat_id):
+    if not file_shutil.which('pg_dump'):
+        log_backup(chat_id,'pg_dump','', 'unavailable','pg_dump не найден на Render')
+        await send(chat_id,"❌ pg_dump не найден. Создание SQL-дампа из текущего контейнера невозможно.",admin_backup_kb()); return
+    backup_dir=BASE_DIR/'backups'; backup_dir.mkdir(exist_ok=True)
+    filename=f"predbot_{datetime.now(MOSCOW_TZ):%Y%m%d_%H%M%S}.sql"; path=backup_dir/filename
+    try:
+        with path.open('wb') as fh:
+            result=subprocess.run(['pg_dump',os.environ['DATABASE_URL'],'--no-owner','--no-privileges'],stdout=fh,stderr=subprocess.PIPE,timeout=120,check=True)
+        log_backup(chat_id,'pg_dump',filename,'success','SQL dump created')
+        await send_document_file(chat_id,path,f"💾 Резервная копия {filename}")
+        add_admin_audit(chat_id,'backup','database',filename,'success')
+        await send(chat_id,'✅ Резервная копия создана. Храните её отдельно от Render.',admin_backup_kb())
+    except Exception as exc:
+        log_backup(chat_id,'pg_dump',filename,'failed',str(exc)); add_admin_audit(chat_id,'backup','database',filename,str(exc))
+        await send(chat_id,f"❌ Ошибка резервной копии: {esc(str(exc))}",admin_backup_kb())
+
 def admin_analytics_kb(): return kb([[{"text":"Сегодня"},{"text":"7 дней"}],[{"text":"30 дней"},{"text":"Всё время"}],[{"text":"🔙 Админ-панель"}]])
 def admin_users_kb(): return kb([[{"text":"🔎 Найти пользователя"}],[{"text":"👥 Последние пользователи"}],[{"text":"🔙 Админ-панель"}]])
 def admin_broadcast_kb(): return kb([[{"text":"👥 Все согласившиеся"}],[{"text":"🔔 С подпиской"}],[{"text":"📦 Покупатели"}],[{"text":"🆕 Новые сегодня"}],[{"text":"🔙 Админ-панель"}]])
@@ -452,6 +545,76 @@ async def handle_state(chat_id, text, state, message):
             if text==label: found=u; break
         if not found: await send(chat_id,"Выберите пользователя.",back_kb()); return
         user_states.pop(chat_id,None); await admin_user_card(chat_id,found['telegram_id']); return
+
+    if t=="admin_prediction_add":
+        if len(text)<10: await send(chat_id,"Слишком короткий текст.",back_kb()); return
+        pid=add_daily_prediction(text[:2000]); add_admin_audit(chat_id,'content_add','daily_prediction',pid,''); user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
+    if t=="admin_prediction_edit":
+        update_daily_prediction(state['prediction_id'],text[:2000]); add_admin_audit(chat_id,'content_edit','daily_prediction',state['prediction_id'],''); user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
+    if t=="admin_prediction_action":
+        pid=state['prediction_id']; p=next((x for x in get_daily_predictions(False) if x['id']==pid),None)
+        if not p: user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
+        if text=="✏️ Изменить": user_states[chat_id]={'type':'admin_prediction_edit','prediction_id':pid}; await send(chat_id,'Введите новый текст прогноза:',back_kb()); return
+        if text in {"⏸ Скрыть","▶️ Показать"}: set_daily_prediction_active(pid,not p['is_active']); user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
+        if text=="🗑 Удалить": delete_daily_prediction(pid); add_admin_audit(chat_id,'content_delete','daily_prediction',pid,''); user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
+        if text=="🔙 Дневные прогнозы": user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
+        await send(chat_id,'Выберите действие.',back_kb()); return
+    if t=="admin_magic_add":
+        if not text: await send(chat_id,'Введите ответ.',back_kb()); return
+        pid=add_magic8_answer(text[:300]); add_admin_audit(chat_id,'content_add','magic8',pid,''); user_states.pop(chat_id,None); await admin_magic_menu(chat_id); return
+    if t=="admin_magic_action":
+        pid=state['magic_id']; p=next((x for x in get_magic8_answers(False) if x['id']==pid),None)
+        if not p: user_states.pop(chat_id,None); await admin_magic_menu(chat_id); return
+        if text=="✏️ Изменить": user_states[chat_id]={'type':'admin_magic_edit','magic_id':pid}; await send(chat_id,'Введите новый ответ:',back_kb()); return
+        if text in {"⏸ Скрыть","▶️ Показать"}: set_magic8_active(pid,not p['is_active']); user_states.pop(chat_id,None); await admin_magic_menu(chat_id); return
+        if text=="🔙 Ответы шара": user_states.pop(chat_id,None); await admin_magic_menu(chat_id); return
+        await send(chat_id,'Выберите действие.',back_kb()); return
+    if t=="admin_magic_edit":
+        update_magic8_answer(state['magic_id'],text[:300]); add_admin_audit(chat_id,'content_edit','magic8',state['magic_id'],''); user_states.pop(chat_id,None); await admin_magic_menu(chat_id); return
+
+    if t=="admin_prediction_list":
+        m=re.match(r"^[🟢⚪] #(\d+)",text)
+        if m:
+            pid=int(m.group(1)); p=next((x for x in get_daily_predictions(False) if x['id']==pid),None)
+            if p:
+                user_states[chat_id]={"type":"admin_prediction_action","prediction_id":pid}
+                await send(chat_id,f"🔮 <b>Прогноз #{pid}</b>\n\n{esc(p['text'])}",kb([[{"text":"✏️ Изменить"}],[{"text":"⏸ Скрыть" if p['is_active'] else "▶️ Показать"}],[{"text":"🗑 Удалить"}],[{"text":"🔙 Дневные прогнозы"}]])); return
+        if text=="➕ Добавить прогноз": user_states[chat_id]={"type":"admin_prediction_add"}; await send(chat_id,'Введите текст нового прогноза:',back_kb()); return
+        if text=="🔙 Контент": user_states.pop(chat_id,None); await admin_content_menu(chat_id); return
+    if t=="admin_magic_list":
+        m=re.match(r"^[🟢⚪] #(\d+)",text)
+        if m:
+            mid=int(m.group(1)); p=next((x for x in get_magic8_answers(False) if x['id']==mid),None)
+            if p:
+                user_states[chat_id]={"type":"admin_magic_action","magic_id":mid}
+                await send(chat_id,f"🎱 <b>Ответ #{mid}</b>\n\n{esc(p['text'])}",kb([[{"text":"✏️ Изменить"}],[{"text":"⏸ Скрыть" if p['is_active'] else "▶️ Показать"}],[{"text":"🔙 Ответы шара"}]])); return
+        if text=="➕ Добавить ответ": user_states[chat_id]={"type":"admin_magic_add"}; await send(chat_id,'Введите новый ответ шара:',back_kb()); return
+
+    if t=="admin_prediction_add":
+        if len(text)<10: await send(chat_id,"Слишком короткий текст.",back_kb()); return
+        pid=add_daily_prediction(text[:2000]); add_admin_audit(chat_id,'content_add','daily_prediction',pid,''); user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
+    if t=="admin_prediction_edit":
+        update_daily_prediction(state['prediction_id'],text[:2000]); add_admin_audit(chat_id,'content_edit','daily_prediction',state['prediction_id'],''); user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
+    if t=="admin_prediction_action":
+        pid=state['prediction_id']; p=next((x for x in get_daily_predictions(False) if x['id']==pid),None)
+        if not p: user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
+        if text=="✏️ Изменить": user_states[chat_id]={'type':'admin_prediction_edit','prediction_id':pid}; await send(chat_id,'Введите новый текст прогноза:',back_kb()); return
+        if text in {"⏸ Скрыть","▶️ Показать"}: set_daily_prediction_active(pid,not p['is_active']); user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
+        if text=="🗑 Удалить": delete_daily_prediction(pid); add_admin_audit(chat_id,'content_delete','daily_prediction',pid,''); user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
+        if text=="🔙 Дневные прогнозы": user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
+        await send(chat_id,'Выберите действие.',back_kb()); return
+    if t=="admin_magic_add":
+        if not text: await send(chat_id,'Введите ответ.',back_kb()); return
+        pid=add_magic8_answer(text[:300]); add_admin_audit(chat_id,'content_add','magic8',pid,''); user_states.pop(chat_id,None); await admin_magic_menu(chat_id); return
+    if t=="admin_magic_action":
+        pid=state['magic_id']; p=next((x for x in get_magic8_answers(False) if x['id']==pid),None)
+        if not p: user_states.pop(chat_id,None); await admin_magic_menu(chat_id); return
+        if text=="✏️ Изменить": user_states[chat_id]={'type':'admin_magic_edit','magic_id':pid}; await send(chat_id,'Введите новый ответ:',back_kb()); return
+        if text in {"⏸ Скрыть","▶️ Показать"}: set_magic8_active(pid,not p['is_active']); user_states.pop(chat_id,None); await admin_magic_menu(chat_id); return
+        if text=="🔙 Ответы шара": user_states.pop(chat_id,None); await admin_magic_menu(chat_id); return
+        await send(chat_id,'Выберите действие.',back_kb()); return
+    if t=="admin_magic_edit":
+        update_magic8_answer(state['magic_id'],text[:300]); add_admin_audit(chat_id,'content_edit','magic8',state['magic_id'],''); user_states.pop(chat_id,None); await admin_magic_menu(chat_id); return
     if t=="admin_broadcast_audience":
         mp={"👥 Все согласившиеся":"all","🔔 С подпиской":"subscribed","📦 Покупатели":"buyers","🆕 Новые сегодня":"new_today"}
         if text not in mp: await send(chat_id,"Выберите аудиторию.",admin_broadcast_kb()); return
@@ -501,8 +664,7 @@ async def handle_state(chat_id, text, state, message):
         user_states.pop(chat_id,None)
         await send_photo(chat_id,"magic8.png","🎱 <b>Чёрный шар 8</b>")
         for msg in ["🔮 Концентрируюсь на вопросе...","✨ Формирую ответ..."]: await typing(chat_id); await send(chat_id,msg); await asyncio.sleep(.8)
-        answers=["Да.","Определённо да!","Без сомнений.","Скорее да, чем нет.","Пока не ясно, попробуйте позже.","Скорее нет, чем да.","Нет.","Определённо нет.","Даже не думайте.","Мой ответ — нет."]
-        await send(chat_id,f"🎱 <b>Ответ:</b> {random.choice(answers)}\n\nОсталось вопросов сегодня: <b>{remaining}</b>.",kb([[{"text":"❓ Задать ещё вопрос"}],[{"text":"🔙 Главное меню"}]])); return
+        await send(chat_id,f"🎱 <b>Ответ:</b> {esc(get_random_magic8_answer())}\n\nОсталось вопросов сегодня: <b>{remaining}</b>.",kb([[{"text":"❓ Задать ещё вопрос"}],[{"text":"🔙 Главное меню"}]])); return
 
     if t=="personal_name":
         if not text: await send(chat_id,"Введите имя:",back_kb()); return
@@ -709,7 +871,7 @@ async def process_update(update):
         return
     if text=="/admin" and chat_id==ADMIN_ID: await send(chat_id,f"👑 <b>Админ-панель</b>\n\nРежим доступа: <b>{BOT_ACCESS_MODE}</b>\nТестировщиков: <b>{len(ALLOWED_USER_IDS)}</b>",admin_kb()); return
     if text in {"🔙 Главное меню","🔙 Главнoe меню"}: await send(chat_id,"Главное меню:",main_kb()); return
-    if text=="🔮 Предсказание на день": await ai_processing(chat_id,"daily"); await send(chat_id,get_random_prediction(),main_kb()); return
+    if text=="🔮 Предсказание на день": await ai_processing(chat_id,"daily"); await send(chat_id,f"🔮 <b>Предсказание на {datetime.now(MOSCOW_TZ):%d.%m.%Y}</b>\n\n{esc(get_random_daily_prediction() or get_random_prediction())}",main_kb()); return
     if text=="✨ Персональное": await begin_personal(chat_id); return
     if text=="🎯 По сферам": await send(chat_id,"Выберите сферу:",sphere_kb()); return
     sm={"❤️ Любовь":"love","💼 Карьера":"career","💰 Финансы":"finance","👨‍👩‍👧 Семья":"family","🌿 Самочувствие":"health","📚 Развитие":"growth"}
@@ -796,6 +958,21 @@ async def process_update(update):
         for p in get_products(False):
             if text in {"🟢 "+p["name"],"⚪ "+p["name"]}: user_states[chat_id]={"type":"admin_selected_product","product_id":p["id"]}; await admin_product(chat_id,p); return
         if text=="📣 Рассылка": user_states[chat_id]={"type":"admin_broadcast_audience"}; await send(chat_id,"📣 <b>Выберите аудиторию</b>",admin_broadcast_kb()); return
+        if text=="📝 Контент": await admin_content_menu(chat_id); return
+        if text=="🔮 Дневные прогнозы": await admin_predictions_menu(chat_id); return
+        if text=="➕ Добавить прогноз": user_states[chat_id]={"type":"admin_prediction_add"}; await send(chat_id,"Введите текст нового дневного прогноза:",back_kb()); return
+        if text=="🔙 Контент": await admin_content_menu(chat_id); return
+        if text=="🎱 Magic 8": await admin_magic_menu(chat_id); return
+        if text=="🎱 Ответы шара": await admin_magic_menu(chat_id); return
+        if text=="➕ Добавить ответ": user_states[chat_id]={"type":"admin_magic_add"}; await send(chat_id,"Введите новый ответ шара:",back_kb()); return
+        if text=="⚖️ Документы": await admin_documents_view(chat_id); return
+        if text=="📤 Экспорт": await send(chat_id,"📤 <b>Экспорт данных</b>",admin_export_kb()); return
+        if text=="👥 Пользователи CSV": await export_csv(chat_id,"users"); return
+        if text=="📦 Заказы CSV": await export_csv(chat_id,"orders"); return
+        if text=="⭐ Отзывы CSV": await export_csv(chat_id,"reviews"); return
+        if text=="💾 Резервная копия": await send(chat_id,"💾 <b>Резервное копирование</b>",admin_backup_kb()); return
+        if text=="💾 Сделать резервную копию": await make_backup(chat_id); return
+        if text=="📋 Последняя копия": await backup_status(chat_id); return
         if text=="🚨 Уведомления": await admin_notifications_view(chat_id); return
         if text in {"🟢 Новые заказы","⚪ Новые заказы","🟢 Изменение статуса","⚪ Изменение статуса","🟢 Новые пользователи","⚪ Новые пользователи","🟢 Безопасность","⚪ Безопасность"}:
             s=get_admin_settings(); mp={"🟢 Новые заказы":"new_order","⚪ Новые заказы":"new_order","🟢 Изменение статуса":"status_change","⚪ Изменение статуса":"status_change","🟢 Новые пользователи":"new_user","⚪ Новые пользователи":"new_user","🟢 Безопасность":"security","⚪ Безопасность":"security"}; key=mp[text]; set_admin_notifications(key,not s[key]); add_admin_audit(chat_id,"notification_setting","admin",1,f"{key}={not s[key]}"); await admin_notifications_view(chat_id); return
