@@ -1,4 +1,4 @@
-# BUILD: PREDBOT-2026-08-23-MYSTICAL-STYLE-01
+# BUILD: PREDBOT-2026-08-23-MINI-APP-01
 import asyncio
 import html
 import os
@@ -6,6 +6,11 @@ import re
 import csv
 import subprocess
 import shutil as file_shutil
+import hmac
+import hashlib
+import json
+import time
+from urllib.parse import parse_qsl, urlencode
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -40,6 +45,8 @@ STATIC_DIR = BASE_DIR / "static"
 LEGAL_DIR = STATIC_DIR / "legal"
 IMAGES_DIR = STATIC_DIR / "images"
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
+WEBAPP_DIR = STATIC_DIR / "webapp"
+WEBAPP_MAX_AGE = int(os.getenv("WEBAPP_MAX_AGE", "86400"))
 BOT_ACCESS_MODE = os.getenv("BOT_ACCESS_MODE", "development").strip().lower()
 
 def parse_user_ids(value):
@@ -163,9 +170,6 @@ def admin_kb():
         [{"text":"🛡 Журнал"},{"text":"⭐ Отзывы"}],
         [{"text":"🚪 Выйти"}],
     ])
-def admin_back_kb():
-    return kb([[{"text":"🔙 Админ-панель"}]])
-
 def admin_order_kb():
     return kb([[{"text":"✅ Подтвердить"},{"text":"❌ Отклонить"}],[{"text":"🔧 В сборке"},{"text":"📦 Готов"}],[{"text":"🚚 В доставке"},{"text":"✅ Завершить"}],[{"text":"🔙 К списку заказов"}]])
 def admin_product_kb(active): return kb([[{"text":"✏️ Изменить название"}],[{"text":"📝 Изменить описание"}],[{"text":"💰 Изменить цену"}],[{"text":"⏸ Скрыть товар" if active else "▶️ Показать товар"}],[{"text":"🗑 Удалить товар"}],[{"text":"🔙 Каталог админа"}]])
@@ -219,7 +223,7 @@ async def ai_processing(chat_id, kind="daily"):
         await asyncio.sleep(0.65)
 
 async def welcome(chat_id):
-    await send_photo(chat_id, "welcome_hero.png")
+    await send_photo(chat_id, "welcome.png")
     links = []
     if PUBLIC_URL:
         links = [
@@ -276,18 +280,435 @@ def is_bad(text):
 def gender_from_text(t): return "male" if t=="👨 Мужчина" else "female" if t=="👩 Женщина" else "other"
 def status_text(s): return {"new":"🆕 Новый","confirmed":"✅ Подтверждён","rejected":"❌ Отклонён","completed":"📦 Завершён"}.get(s,s)
 
+
+def _telegram_init_data_hash(raw: str) -> str:
+    data = dict(parse_qsl(raw, keep_blank_values=True))
+    received_hash = data.pop("hash", "")
+    pairs = [f"{k}={v}" for k, v in sorted(data.items())]
+    data_check_string = "\n".join(pairs)
+    secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    calc = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+    return received_hash, calc
+
+
+def validate_webapp_init_data(raw: str):
+    if not raw:
+        raise web.HTTPUnauthorized(text=json.dumps({"error": "Telegram авторизация не получена"}), content_type="application/json")
+
+    received_hash, calc = _telegram_init_data_hash(raw)
+    if not received_hash or not hmac.compare_digest(received_hash, calc):
+        raise web.HTTPUnauthorized(text=json.dumps({"error": "Недействительные данные Telegram"}), content_type="application/json")
+
+    parsed = dict(parse_qsl(raw, keep_blank_values=True))
+    try:
+        auth_date = int(parsed.get("auth_date", "0"))
+    except ValueError:
+        auth_date = 0
+
+    if not auth_date or time.time() - auth_date > WEBAPP_MAX_AGE:
+        raise web.HTTPUnauthorized(text=json.dumps({"error": "Сессия Telegram устарела"}), content_type="application/json")
+
+    try:
+        user = json.loads(parsed.get("user", "{}"))
+    except json.JSONDecodeError:
+        user = {}
+
+    telegram_id = int(user.get("id", 0))
+    if telegram_id <= 0:
+        raise web.HTTPUnauthorized(text=json.dumps({"error": "Не удалось определить пользователя"}), content_type="application/json")
+
+    if not is_access_allowed(telegram_id):
+        raise web.HTTPForbidden(text=json.dumps({"error": "Доступ к боту закрыт"}), content_type="application/json")
+
+    return telegram_id, user
+
+
+async def webapp_user(request):
+    raw = request.headers.get("X-Telegram-Init-Data", "")
+    return validate_webapp_init_data(raw)
+
+
+def web_status_label(status):
+    return {
+        "new": "🆕 Новый",
+        "confirmed": "✅ Подтверждён",
+        "assembling": "🔧 В сборке",
+        "ready": "📦 Готов",
+        "shipping": "🚚 В доставке",
+        "completed": "✅ Завершён",
+        "rejected": "❌ Отклонён",
+    }.get(status, status)
+
+
+def web_user_payload(telegram_id):
+    ensure_user(telegram_id)
+    u = get_user(telegram_id) or {
+        "telegram_id": telegram_id, "name": "", "gender": "", "birthdate": "",
+        "phone": "", "username": "", "consent_given": False, "consent_version": "",
+    }
+    out = dict(u)
+    for key in ("created_at", "consent_at"):
+        if hasattr(out.get(key), "isoformat"):
+            out[key] = out[key].isoformat()
+    return out
+
+
+async def webapp_index(request):
+    f = WEBAPP_DIR / "index.html"
+    if not f.exists():
+        return web.Response(status=404, text="Web App is not installed")
+    return web.FileResponse(f)
+
+
+async def webapp_auth(request):
+    uid, tg_user = await webapp_user(request)
+    u = web_user_payload(uid)
+    return web.json_response({
+        "user": u,
+        "is_admin": uid == ADMIN_ID,
+        "access_mode": BOT_ACCESS_MODE,
+        "telegram_user": tg_user,
+    })
+
+
+async def webapp_consent(request):
+    uid, _ = await webapp_user(request)
+    give_consent(uid)
+    return web.json_response({"user": web_user_payload(uid)})
+
+
+async def webapp_catalog(request):
+    uid, _ = await webapp_user(request)
+    u = web_user_payload(uid)
+    if not u["consent_given"]:
+        raise web.HTTPForbidden(text=json.dumps({"error": "Сначала подтвердите согласие"}), content_type="application/json")
+    return web.json_response({"products": get_products(True)})
+
+
+async def webapp_catalog_item(request):
+    uid, _ = await webapp_user(request)
+    u = web_user_payload(uid)
+    if not u["consent_given"]:
+        raise web.HTTPForbidden(text=json.dumps({"error": "Сначала подтвердите согласие"}), content_type="application/json")
+    p = get_product(int(request.match_info["product_id"]))
+    if not p or not p["is_active"]:
+        raise web.HTTPNotFound(text=json.dumps({"error": "Товар не найден"}), content_type="application/json")
+    return web.json_response({"product": p})
+
+
+async def webapp_orders(request):
+    uid, _ = await webapp_user(request)
+    u = web_user_payload(uid)
+    if not u["consent_given"]:
+        raise web.HTTPForbidden(text=json.dumps({"error": "Сначала подтвердите согласие"}), content_type="application/json")
+    if request.method == "GET":
+        rows = get_user_orders(uid)
+        for row in rows:
+            row["status_label"] = web_status_label(row["status"])
+            if hasattr(row.get("created_at"), "isoformat"):
+                row["created_at"] = row["created_at"].isoformat()
+        return web.json_response({"orders": rows})
+
+    body = await request.json()
+    product_id = int(body.get("product_id", 0))
+    name = (body.get("name") or "").strip()[:50]
+    phone = (body.get("phone") or "").strip()
+    if not name or not valid_phone(phone):
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Проверьте имя и номер телефона"}), content_type="application/json")
+    oid = create_order(uid, product_id, name, phone)
+    update_user_field(uid, "name", name)
+    update_user_field(uid, "phone", phone)
+    if ADMIN_ID:
+        try:
+            p = get_product(product_id)
+            await send(ADMIN_ID, f"🆕 <b>Новый заказ №{oid}</b>\n\n💎 {esc(p['name'])}\n👤 {esc(name)}\n📞 {esc(phone)}\n🆔 {uid}", admin_kb())
+            add_admin_audit(ADMIN_ID, "web_order", "order", oid, f"user={uid}")
+        except Exception:
+            pass
+    return web.json_response({"order_id": oid})
+
+
+async def webapp_profile(request):
+    uid, _ = await webapp_user(request)
+    u = web_user_payload(uid)
+    if request.method == "GET":
+        return web.json_response({"user": u})
+    if request.method != "POST":
+        raise web.HTTPMethodNotAllowed(request.method, ["GET", "POST"])
+    body = await request.json()
+    name = (body.get("name") or "").strip()[:50]
+    gender = (body.get("gender") or "").strip()
+    birthdate = (body.get("birthdate") or "").strip()
+    phone = (body.get("phone") or "").strip()
+    if birthdate and not valid_date(birthdate):
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Неверная дата рождения"}), content_type="application/json")
+    if phone and not valid_phone(phone):
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Неверный номер телефона"}), content_type="application/json")
+    for field, value in [("name", name), ("gender", gender), ("birthdate", birthdate), ("phone", phone)]:
+        update_user_field(uid, field, value)
+    return web.json_response({"user": web_user_payload(uid)})
+
+
+async def webapp_delete_profile(request):
+    uid, _ = await webapp_user(request)
+    delete_user_data(uid)
+    return web.json_response({"ok": True})
+
+
+async def webapp_subscription(request):
+    uid, _ = await webapp_user(request)
+    u = web_user_payload(uid)
+    if not u["consent_given"]:
+        raise web.HTTPForbidden(text=json.dumps({"error": "Сначала подтвердите согласие"}), content_type="application/json")
+    if request.method == "GET":
+        sub = get_subscription(uid) or {"time": "09:00", "active": False}
+        return web.json_response(sub)
+    body = await request.json()
+    time_local = str(body.get("time") or "09:00")
+    active = bool(body.get("active", True))
+    try:
+        datetime.strptime(time_local, "%H:%M")
+    except ValueError:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Неверное время"}), content_type="application/json")
+    set_subscription(uid, time_local, active)
+    return web.json_response(get_subscription(uid))
+
+
+async def webapp_forecast(request):
+    uid, _ = await webapp_user(request)
+    u = web_user_payload(uid)
+    if not u["consent_given"]:
+        raise web.HTTPForbidden(text=json.dumps({"error": "Сначала подтвердите согласие"}), content_type="application/json")
+    body = await request.json()
+    kind = request.match_info["kind"]
+
+    if kind == "daily":
+        forecast = get_random_daily_prediction() or get_random_prediction()
+        return web.json_response({"html": esc(forecast).replace("\n", "<br>")})
+
+    name = (body.get("name") or u["name"] or "").strip()[:50]
+    gender = (body.get("gender") or u["gender"] or "other").strip()
+    birthdate = (body.get("birthdate") or u["birthdate"] or "").strip()
+    sphere = body.get("sphere")
+
+    if not name:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Введите имя"}), content_type="application/json")
+    if not valid_date(birthdate):
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Дата рождения должна быть в формате ДД.ММ.ГГГГ"}), content_type="application/json")
+
+    update_user_field(uid, "name", name)
+    update_user_field(uid, "gender", gender)
+    update_user_field(uid, "birthdate", birthdate)
+
+    if sphere:
+        forecast = get_sphere_forecast(birthdate, gender, name, sphere)
+    else:
+        forecast = get_personal_forecast(birthdate, gender, name)
+
+    return web.json_response({"html": esc(forecast).replace("\n", "<br>"), "user": web_user_payload(uid)})
+
+
+async def webapp_my_day(request):
+    uid, _ = await webapp_user(request)
+    u = web_user_payload(uid)
+    if not u["consent_given"] or not u["birthdate"]:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Сначала заполните дату рождения"}), content_type="application/json")
+    text = get_personal_forecast(u["birthdate"], u["gender"] or "other", u["name"] or "Друг")
+    return web.json_response({"html": esc(text).replace("\n", "<br>")})
+
+
+async def webapp_magic8(request):
+    uid, _ = await webapp_user(request)
+    u = web_user_payload(uid)
+    if not u["consent_given"]:
+        raise web.HTTPForbidden(text=json.dumps({"error": "Сначала подтвердите согласие"}), content_type="application/json")
+    if request.method == "GET":
+        return web.json_response({"remaining": get_magic8_remaining(uid)})
+    body = await request.json()
+    q = (body.get("question") or "").strip()[:250]
+    if not q or is_bad(q):
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Сформулируйте короткий и уважительный вопрос"}), content_type="application/json")
+    ok, remaining = consume_magic8_question(uid)
+    if not ok:
+        raise web.HTTPTooManyRequests(text=json.dumps({"error": "Лимит в 3 вопроса на сегодня исчерпан"}), content_type="application/json")
+    return web.json_response({"answer": get_random_magic8_answer(), "remaining": remaining})
+
+
+async def webapp_gift_prediction(request):
+    uid, _ = await webapp_user(request)
+    u = web_user_payload(uid)
+    if not u["consent_given"]:
+        raise web.HTTPForbidden(text=json.dumps({"error": "Сначала подтвердите согласие"}), content_type="application/json")
+    body = await request.json()
+    username = (body.get("username") or "").strip()
+    if not username.startswith("@") or len(username) < 2:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Введите @username"}), content_type="application/json")
+    recipient = get_user_by_username(username)
+    if not recipient:
+        raise web.HTTPNotFound(text=json.dumps({"error": "Пользователь не найден среди тех, кто уже запускал бота"}), content_type="application/json")
+    if recipient["telegram_id"] == uid:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Нельзя отправить подарок самому себе"}), content_type="application/json")
+    text = get_random_daily_prediction() or get_random_prediction()
+    await send(recipient["telegram_id"], f"🎁 <b>Вам подарили предсказание!</b>\n\n{esc(text)}", main_kb())
+    return web.json_response({"ok": True})
+
+
+async def webapp_review(request):
+    uid, _ = await webapp_user(request)
+    u = web_user_payload(uid)
+    if not u["consent_given"]:
+        raise web.HTTPForbidden(text=json.dumps({"error": "Сначала подтвердите согласие"}), content_type="application/json")
+    body = await request.json()
+    order_id = int(body.get("order_id", 0))
+    rating = int(body.get("rating", 0))
+    text = (body.get("text") or "").strip()[:1000]
+    if rating not in {1,2,3,4,5}:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Оценка должна быть от 1 до 5"}), content_type="application/json")
+    order = get_order(order_id)
+    if not order or order["telegram_id"] != uid or order["status"] != "completed":
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Отзыв доступен только по вашему завершённому заказу"}), content_type="application/json")
+    add_review(order_id, uid, rating, text)
+    return web.json_response({"ok": True})
+
+
+async def webapp_legal(request):
+    await webapp_user(request)
+    docs = get_legal_documents()
+    fallback = {
+        "policy_personal_data": "01_policy_personal_data.html",
+        "consent_personal_data": "02_consent_personal_data.html",
+        "confidentiality_security": "03_confidentiality_security.html",
+        "user_agreement": "04_user_agreement.html",
+        "public_offer": "05_public_offer.html",
+        "disclaimer_predictions": "06_disclaimer_predictions.html",
+        "marketing_consent": "07_marketing_consent.html",
+        "data_subject_requests": "08_data_subject_requests.html",
+    }
+    result = []
+    for d in docs:
+        file_name = fallback.get(d.get("key", ""), "")
+        url = d.get("url") or (f"{PUBLIC_URL}/legal/{file_name}" if PUBLIC_URL and file_name else "")
+        result.append({"title": d.get("title") or "Документ", "url": url, "version": d.get("version") or ""})
+    if not result:
+        for key, file_name in fallback.items():
+            result.append({"title": key, "url": f"{PUBLIC_URL}/legal/{file_name}" if PUBLIC_URL else "", "version": ""})
+    return web.json_response({"documents": result})
+
+
+# ----- Admin -----
+def require_admin(uid):
+    if uid != ADMIN_ID:
+        raise web.HTTPForbidden(text=json.dumps({"error": "Недостаточно прав"}), content_type="application/json")
+
+
+async def webapp_admin_analytics(request):
+    uid, _ = await webapp_user(request); require_admin(uid)
+    raw = request.query.get("days", "")
+    days = int(raw) if raw else None
+    return web.json_response({"stats": get_analytics(days)})
+
+
+async def webapp_admin_orders(request):
+    uid, _ = await webapp_user(request); require_admin(uid)
+    if request.method == "GET":
+        rows = get_recent_orders(100)
+        for row in rows:
+            if hasattr(row.get("created_at"), "isoformat"):
+                row["created_at"] = row["created_at"].isoformat()
+        return web.json_response({"orders": rows})
+    oid = int(request.match_info["order_id"])
+    body = await request.json()
+    status = str(body.get("status") or "")
+    set_order_status(oid, status)
+    add_admin_audit(uid, "web_order_status", "order", oid, status)
+    order = get_order(oid)
+    if order:
+        try:
+            await send(order["telegram_id"], f"{web_status_label(status)} Заказ №{oid}.", main_kb())
+        except Exception:
+            pass
+    return web.json_response({"ok": True})
+
+
+async def webapp_admin_users(request):
+    uid, _ = await webapp_user(request); require_admin(uid)
+    q = request.query.get("q", "").strip()
+    rows = search_users(q, 100)
+    for row in rows:
+        if hasattr(row.get("created_at"), "isoformat"):
+            row["created_at"] = row["created_at"].isoformat()
+    return web.json_response({"users": rows})
+
+
+async def webapp_admin_products(request):
+    uid, _ = await webapp_user(request); require_admin(uid)
+    return web.json_response({"products": get_products(False)})
+
+
+async def webapp_admin_content(request):
+    uid, _ = await webapp_user(request); require_admin(uid)
+    return web.json_response({"predictions": get_daily_predictions(False)})
+
+
+async def webapp_admin_magic(request):
+    uid, _ = await webapp_user(request); require_admin(uid)
+    return web.json_response({"answers": get_magic8_answers(False)})
+
+
+async def webapp_admin_audit(request):
+    uid, _ = await webapp_user(request); require_admin(uid)
+    raw = get_admin_audit(100)
+    rows = []
+    for r in raw:
+        rows.append({
+            "id": r[0], "admin_id": r[1], "action": r[2],
+            "entity_type": r[3], "entity_id": r[4], "details": r[5],
+            "created_at": r[6].isoformat() if hasattr(r[6], "isoformat") else str(r[6]),
+        })
+    return web.json_response({"rows": rows})
+
+
 async def homepage(request):
     f=STATIC_DIR/"index.html"
     return web.FileResponse(f) if f.exists() else web.Response(text="OK")
-async def health(request): return web.json_response({"status":"ok","build":"PREDBOT-2026-08-18-FULL-CHECK-02"})
+async def health(request): return web.json_response({"status":"ok","build":"PREDBOT-2026-08-23-MINI-APP-01"})
 app.router.add_get("/",homepage); app.router.add_get("/health",health); app.router.add_static("/static",path=str(STATIC_DIR),name="static"); app.router.add_static("/legal",path=str(LEGAL_DIR),name="legal")
+app.router.add_get("/app", webapp_index)
+app.router.add_get("/app/", webapp_index)
+app.router.add_static("/app/static", path=str(WEBAPP_DIR), name="webapp-static")
+app.router.add_post("/api/webapp/auth", webapp_auth)
+app.router.add_post("/api/webapp/consent", webapp_consent)
+app.router.add_route("GET", "/api/webapp/catalog", webapp_catalog)
+app.router.add_route("GET", "/api/webapp/catalog/{product_id}", webapp_catalog_item)
+app.router.add_route("GET", "/api/webapp/orders", webapp_orders)
+app.router.add_route("POST", "/api/webapp/orders", webapp_orders)
+app.router.add_route("GET", "/api/webapp/profile", webapp_profile)
+app.router.add_route("POST", "/api/webapp/profile", webapp_profile)
+app.router.add_post("/api/webapp/profile/delete", webapp_delete_profile)
+app.router.add_route("GET", "/api/webapp/subscription", webapp_subscription)
+app.router.add_route("POST", "/api/webapp/subscription", webapp_subscription)
+app.router.add_post("/api/webapp/forecast/{kind}", webapp_forecast)
+app.router.add_get("/api/webapp/my-day", webapp_my_day)
+app.router.add_route("GET", "/api/webapp/magic8/remaining", webapp_magic8)
+app.router.add_post("/api/webapp/magic8/ask", webapp_magic8)
+app.router.add_post("/api/webapp/gift/prediction", webapp_gift_prediction)
+app.router.add_post("/api/webapp/reviews", webapp_review)
+app.router.add_get("/api/webapp/legal", webapp_legal)
+app.router.add_get("/api/webapp/admin/analytics", webapp_admin_analytics)
+app.router.add_route("GET", "/api/webapp/admin/orders", webapp_admin_orders)
+app.router.add_post("/api/webapp/admin/orders/{order_id}", webapp_admin_orders)
+app.router.add_get("/api/webapp/admin/users", webapp_admin_users)
+app.router.add_get("/api/webapp/admin/products", webapp_admin_products)
+app.router.add_get("/api/webapp/admin/content", webapp_admin_content)
+app.router.add_get("/api/webapp/admin/magic8", webapp_admin_magic)
+app.router.add_get("/api/webapp/admin/audit", webapp_admin_audit)
+
 
 def legal_url(filename):
     base = PUBLIC_URL or ""
     return f"{base}/legal/{filename}"
 
 async def show_legal_documents(chat_id):
-    await send_photo(chat_id, "legal.png")
     if not PUBLIC_URL:
         await send(
             chat_id,
@@ -308,7 +729,6 @@ async def show_legal_documents(chat_id):
 async def ensure_profile(chat_id): ensure_user(chat_id); return get_user(chat_id)
 
 async def begin_personal(chat_id,sphere=None):
-    await send_photo(chat_id, "spheres.png" if sphere else "personal_forecast.png")
     u=await ensure_profile(chat_id)
     if not u["name"]: user_states[chat_id]={"type":"personal_name","sphere":sphere}; await send(chat_id,"Как вас зовут?",back_kb()); return
     if not u["gender"]: user_states[chat_id]={"type":"personal_gender","sphere":sphere}; await send(chat_id,"Укажите ваш пол — это помогает сформировать обращение.",gender_kb()); return
@@ -321,7 +741,6 @@ async def produce_forecast(chat_id,u,sphere=None):
     await send(chat_id,text,main_kb())
 
 async def show_catalog(chat_id):
-    await send_photo(chat_id, "catalog.png")
     if not get_products(True): await send(chat_id,"Каталог временно пуст.",main_kb()); return
     await send(chat_id,"💎 <b>Каталог</b>\n\nВыберите бусину Дзи:",catalog_kb())
 
@@ -331,7 +750,6 @@ async def show_product(chat_id,p):
     await send(chat_id,f"💎 <b>{esc(p['name'])}</b>\n\n{esc(p['description'])}\n\n💰 <b>{price} ₽</b>",product_kb())
 
 async def show_account(chat_id):
-    await send_photo(chat_id, "profile.png")
     u=await ensure_profile(chat_id); orders=get_user_orders(chat_id)
     g={"male":"мужчина","female":"женщина","other":"не указано"}.get(u["gender"],"не указано")
     await send(chat_id,f"👤 <b>Личный кабинет</b>\n\nИмя: <b>{esc(u['name'] or 'не указано')}</b>\nПол: <b>{g}</b>\nДата рождения: <b>{esc(u['birthdate'] or 'не указана')}</b>\nТелефон: <b>{esc(u['phone'] or 'не указан')}</b>\nЗаказов: <b>{len(orders)}</b>",account_kb())
@@ -363,7 +781,6 @@ async def show_orders(chat_id):
         await send(chat_id, "\n".join(parts), account_kb())
 
 async def show_notifications(chat_id):
-    await send_photo(chat_id, "notifications.png")
     sub=get_subscription(chat_id)
     if sub and sub["active"]:
         await send(chat_id,f"🔔 <b>Уведомления включены</b>\n\nКаждый день в <b>{sub['time']}</b> по Москве я сообщу, что ваше предсказание на день готово.",notifications_kb(True))
@@ -506,11 +923,6 @@ async def admin_product(chat_id,p):
 async def handle_state(chat_id, text, state, message):
     t = state["type"]
 
-    if t.startswith("admin_") and text in {"🔙 Главное меню", "🔙 Админ-панель", "❌ Отмена", "/cancel"}:
-        user_states.pop(chat_id, None)
-        await send(chat_id, "👑 <b>Админ-панель</b>", admin_kb())
-        return
-
     if text == "🔙 Главное меню" and t != "consent":
         user_states.pop(chat_id, None)
         await send(chat_id, "Главное меню:", main_kb())
@@ -556,32 +968,32 @@ async def handle_state(chat_id, text, state, message):
         for u in state.get("results",{}).values():
             label=f"{u.get('username') or u.get('name') or u['telegram_id']} · {u['telegram_id']}"
             if text==label: found=u; break
-        if not found: await send(chat_id,"Выберите пользователя.",admin_back_kb()); return
+        if not found: await send(chat_id,"Выберите пользователя.",back_kb()); return
         user_states.pop(chat_id,None); await admin_user_card(chat_id,found['telegram_id']); return
 
     if t=="admin_prediction_add":
-        if len(text)<10: await send(chat_id,"Слишком короткий текст.",admin_back_kb()); return
+        if len(text)<10: await send(chat_id,"Слишком короткий текст.",back_kb()); return
         pid=add_daily_prediction(text[:2000]); add_admin_audit(chat_id,'content_add','daily_prediction',pid,''); user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
     if t=="admin_prediction_edit":
         update_daily_prediction(state['prediction_id'],text[:2000]); add_admin_audit(chat_id,'content_edit','daily_prediction',state['prediction_id'],''); user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
     if t=="admin_prediction_action":
         pid=state['prediction_id']; p=next((x for x in get_daily_predictions(False) if x['id']==pid),None)
         if not p: user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
-        if text=="✏️ Изменить": user_states[chat_id]={'type':'admin_prediction_edit','prediction_id':pid}; await send(chat_id,'Введите новый текст прогноза:',admin_back_kb()); return
+        if text=="✏️ Изменить": user_states[chat_id]={'type':'admin_prediction_edit','prediction_id':pid}; await send(chat_id,'Введите новый текст прогноза:',back_kb()); return
         if text in {"⏸ Скрыть","▶️ Показать"}: set_daily_prediction_active(pid,not p['is_active']); user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
         if text=="🗑 Удалить": delete_daily_prediction(pid); add_admin_audit(chat_id,'content_delete','daily_prediction',pid,''); user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
         if text=="🔙 Дневные прогнозы": user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
-        await send(chat_id,'Выберите действие.',admin_back_kb()); return
+        await send(chat_id,'Выберите действие.',back_kb()); return
     if t=="admin_magic_add":
-        if not text: await send(chat_id,'Введите ответ.',admin_back_kb()); return
+        if not text: await send(chat_id,'Введите ответ.',back_kb()); return
         pid=add_magic8_answer(text[:300]); add_admin_audit(chat_id,'content_add','magic8',pid,''); user_states.pop(chat_id,None); await admin_magic_menu(chat_id); return
     if t=="admin_magic_action":
         pid=state['magic_id']; p=next((x for x in get_magic8_answers(False) if x['id']==pid),None)
         if not p: user_states.pop(chat_id,None); await admin_magic_menu(chat_id); return
-        if text=="✏️ Изменить": user_states[chat_id]={'type':'admin_magic_edit','magic_id':pid}; await send(chat_id,'Введите новый ответ:',admin_back_kb()); return
+        if text=="✏️ Изменить": user_states[chat_id]={'type':'admin_magic_edit','magic_id':pid}; await send(chat_id,'Введите новый ответ:',back_kb()); return
         if text in {"⏸ Скрыть","▶️ Показать"}: set_magic8_active(pid,not p['is_active']); user_states.pop(chat_id,None); await admin_magic_menu(chat_id); return
         if text=="🔙 Ответы шара": user_states.pop(chat_id,None); await admin_magic_menu(chat_id); return
-        await send(chat_id,'Выберите действие.',admin_back_kb()); return
+        await send(chat_id,'Выберите действие.',back_kb()); return
     if t=="admin_magic_edit":
         update_magic8_answer(state['magic_id'],text[:300]); add_admin_audit(chat_id,'content_edit','magic8',state['magic_id'],''); user_states.pop(chat_id,None); await admin_magic_menu(chat_id); return
 
@@ -592,7 +1004,7 @@ async def handle_state(chat_id, text, state, message):
             if p:
                 user_states[chat_id]={"type":"admin_prediction_action","prediction_id":pid}
                 await send(chat_id,f"🔮 <b>Прогноз #{pid}</b>\n\n{esc(p['text'])}",kb([[{"text":"✏️ Изменить"}],[{"text":"⏸ Скрыть" if p['is_active'] else "▶️ Показать"}],[{"text":"🗑 Удалить"}],[{"text":"🔙 Дневные прогнозы"}]])); return
-        if text=="➕ Добавить прогноз": user_states[chat_id]={"type":"admin_prediction_add"}; await send(chat_id,'Введите текст нового прогноза:',admin_back_kb()); return
+        if text=="➕ Добавить прогноз": user_states[chat_id]={"type":"admin_prediction_add"}; await send(chat_id,'Введите текст нового прогноза:',back_kb()); return
         if text=="🔙 Контент": user_states.pop(chat_id,None); await admin_content_menu(chat_id); return
     if t=="admin_magic_list":
         m=re.match(r"^[🟢⚪] #(\d+)",text)
@@ -601,37 +1013,37 @@ async def handle_state(chat_id, text, state, message):
             if p:
                 user_states[chat_id]={"type":"admin_magic_action","magic_id":mid}
                 await send(chat_id,f"🎱 <b>Ответ #{mid}</b>\n\n{esc(p['text'])}",kb([[{"text":"✏️ Изменить"}],[{"text":"⏸ Скрыть" if p['is_active'] else "▶️ Показать"}],[{"text":"🔙 Ответы шара"}]])); return
-        if text=="➕ Добавить ответ": user_states[chat_id]={"type":"admin_magic_add"}; await send(chat_id,'Введите новый ответ шара:',admin_back_kb()); return
+        if text=="➕ Добавить ответ": user_states[chat_id]={"type":"admin_magic_add"}; await send(chat_id,'Введите новый ответ шара:',back_kb()); return
 
     if t=="admin_prediction_add":
-        if len(text)<10: await send(chat_id,"Слишком короткий текст.",admin_back_kb()); return
+        if len(text)<10: await send(chat_id,"Слишком короткий текст.",back_kb()); return
         pid=add_daily_prediction(text[:2000]); add_admin_audit(chat_id,'content_add','daily_prediction',pid,''); user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
     if t=="admin_prediction_edit":
         update_daily_prediction(state['prediction_id'],text[:2000]); add_admin_audit(chat_id,'content_edit','daily_prediction',state['prediction_id'],''); user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
     if t=="admin_prediction_action":
         pid=state['prediction_id']; p=next((x for x in get_daily_predictions(False) if x['id']==pid),None)
         if not p: user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
-        if text=="✏️ Изменить": user_states[chat_id]={'type':'admin_prediction_edit','prediction_id':pid}; await send(chat_id,'Введите новый текст прогноза:',admin_back_kb()); return
+        if text=="✏️ Изменить": user_states[chat_id]={'type':'admin_prediction_edit','prediction_id':pid}; await send(chat_id,'Введите новый текст прогноза:',back_kb()); return
         if text in {"⏸ Скрыть","▶️ Показать"}: set_daily_prediction_active(pid,not p['is_active']); user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
         if text=="🗑 Удалить": delete_daily_prediction(pid); add_admin_audit(chat_id,'content_delete','daily_prediction',pid,''); user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
         if text=="🔙 Дневные прогнозы": user_states.pop(chat_id,None); await admin_predictions_menu(chat_id); return
-        await send(chat_id,'Выберите действие.',admin_back_kb()); return
+        await send(chat_id,'Выберите действие.',back_kb()); return
     if t=="admin_magic_add":
-        if not text: await send(chat_id,'Введите ответ.',admin_back_kb()); return
+        if not text: await send(chat_id,'Введите ответ.',back_kb()); return
         pid=add_magic8_answer(text[:300]); add_admin_audit(chat_id,'content_add','magic8',pid,''); user_states.pop(chat_id,None); await admin_magic_menu(chat_id); return
     if t=="admin_magic_action":
         pid=state['magic_id']; p=next((x for x in get_magic8_answers(False) if x['id']==pid),None)
         if not p: user_states.pop(chat_id,None); await admin_magic_menu(chat_id); return
-        if text=="✏️ Изменить": user_states[chat_id]={'type':'admin_magic_edit','magic_id':pid}; await send(chat_id,'Введите новый ответ:',admin_back_kb()); return
+        if text=="✏️ Изменить": user_states[chat_id]={'type':'admin_magic_edit','magic_id':pid}; await send(chat_id,'Введите новый ответ:',back_kb()); return
         if text in {"⏸ Скрыть","▶️ Показать"}: set_magic8_active(pid,not p['is_active']); user_states.pop(chat_id,None); await admin_magic_menu(chat_id); return
         if text=="🔙 Ответы шара": user_states.pop(chat_id,None); await admin_magic_menu(chat_id); return
-        await send(chat_id,'Выберите действие.',admin_back_kb()); return
+        await send(chat_id,'Выберите действие.',back_kb()); return
     if t=="admin_magic_edit":
         update_magic8_answer(state['magic_id'],text[:300]); add_admin_audit(chat_id,'content_edit','magic8',state['magic_id'],''); user_states.pop(chat_id,None); await admin_magic_menu(chat_id); return
     if t=="admin_broadcast_audience":
         mp={"👥 Все согласившиеся":"all","🔔 С подпиской":"subscribed","📦 Покупатели":"buyers","🆕 Новые сегодня":"new_today"}
         if text not in mp: await send(chat_id,"Выберите аудиторию.",admin_broadcast_kb()); return
-        user_states[chat_id]={"type":"admin_broadcast_text","audience":mp[text]}; await send(chat_id,"Введите текст рассылки. /cancel — отмена",admin_back_kb()); return
+        user_states[chat_id]={"type":"admin_broadcast_text","audience":mp[text]}; await send(chat_id,"Введите текст рассылки. /cancel — отмена",back_kb()); return
     if t=="admin_broadcast_text":
         recipients=get_broadcast_recipients(state['audience']); sent_count=0; failed=0
         for uid in recipients:
@@ -645,15 +1057,15 @@ async def handle_state(chat_id, text, state, message):
         if text=="🔙 Каталог админа":
             user_states.pop(chat_id,None); await admin_catalog(chat_id); return
         if text=="✏️ Изменить название":
-            user_states[chat_id]={"type":"admin_edit_name","product_id":p["id"]}; await send(chat_id,"Введите новое название:",admin_back_kb()); return
+            user_states[chat_id]={"type":"admin_edit_name","product_id":p["id"]}; await send(chat_id,"Введите новое название:",back_kb()); return
         if text=="📝 Изменить описание":
-            user_states[chat_id]={"type":"admin_edit_description","product_id":p["id"]}; await send(chat_id,"Введите новое описание:",admin_back_kb()); return
+            user_states[chat_id]={"type":"admin_edit_description","product_id":p["id"]}; await send(chat_id,"Введите новое описание:",back_kb()); return
         if text=="💰 Изменить цену":
-            user_states[chat_id]={"type":"admin_edit_price","product_id":p["id"]}; await send(chat_id,"Введите новую цену:",admin_back_kb()); return
+            user_states[chat_id]={"type":"admin_edit_price","product_id":p["id"]}; await send(chat_id,"Введите новую цену:",back_kb()); return
         if text=="🖼 Изменить изображение":
-            user_states[chat_id]={"type":"admin_edit_image","product_id":p["id"]}; await send(chat_id,"Введите имя файла из static/images или - чтобы убрать.",admin_back_kb()); return
+            user_states[chat_id]={"type":"admin_edit_image","product_id":p["id"]}; await send(chat_id,"Введите имя файла из static/images или - чтобы убрать.",back_kb()); return
         if text=="🖼 Изменить изображение":
-            user_states[chat_id]={"type":"admin_edit_image","product_id":p["id"]}; await send(chat_id,"Введите имя файла из static/images, например <b>dzi_9.png</b>, или - чтобы убрать:",admin_back_kb()); return
+            user_states[chat_id]={"type":"admin_edit_image","product_id":p["id"]}; await send(chat_id,"Введите имя файла из static/images, например <b>dzi_9.png</b>, или - чтобы убрать:",back_kb()); return
         if text in {"⏸ Скрыть товар","▶️ Показать товар"}:
             set_product_active(p["id"],not p["is_active"]); await admin_product(chat_id,get_product(p["id"])); return
         if text == "🗑 Удалить товар":
@@ -694,11 +1106,11 @@ async def handle_state(chat_id, text, state, message):
         user_states.pop(chat_id,None); await send(chat_id,"Удаление отменено.",main_kb()); return
 
     if t=="notification_time":
-        if text=="⌨️ Другое время": user_states[chat_id]={"type":"notification_custom_time"}; await send(chat_id,"Введите время ЧЧ:ММ, например 09:30:",admin_back_kb()); return
+        if text=="⌨️ Другое время": user_states[chat_id]={"type":"notification_custom_time"}; await send(chat_id,"Введите время ЧЧ:ММ, например 09:30:",back_kb()); return
         if not valid_time(text): await send(chat_id,"Выберите время кнопкой.",time_kb()); return
         set_subscription(chat_id,text,True); user_states.pop(chat_id,None); await send(chat_id,f"🔔 Уведомления включены. Каждый день в {text} по Москве я сообщу, что ваше предсказание готово.",main_kb()); return
     if t=="notification_custom_time":
-        if not valid_time(text): await send(chat_id,"Неверное время. Пример: 09:30",admin_back_kb()); return
+        if not valid_time(text): await send(chat_id,"Неверное время. Пример: 09:30",back_kb()); return
         set_subscription(chat_id,text,True); user_states.pop(chat_id,None); await send(chat_id,f"🔔 Уведомления включены на {text} по Москве.",main_kb()); return
     if t=="gift_prediction_username":
         username=text.strip()
@@ -717,7 +1129,7 @@ async def handle_state(chat_id, text, state, message):
         if t=="account_edit_phone": update_user_field(chat_id,"phone",phone); user_states.pop(chat_id,None); await show_account(chat_id); return
         user_states[chat_id]={"type":"order_confirm","product_id":state["product_id"],"name":state["name"],"phone":phone}; p=get_product(state["product_id"]); price=f"{p['price_rub']:,}".replace(","," "); await send(chat_id,f"🧾 <b>Проверьте заказ</b>\n\n💎 {esc(p['name'])}\n💰 {price} ₽\n👤 {esc(state['name'])}\n📞 {esc(phone)}\n\nВсё верно?",order_confirm_kb()); return
     if t=="order_manual_phone":
-        if not valid_phone(text): await send(chat_id,"Неверный номер.",admin_back_kb()); return
+        if not valid_phone(text): await send(chat_id,"Неверный номер.",back_kb()); return
         user_states[chat_id]={"type":"order_confirm","product_id":state["product_id"],"name":state["name"],"phone":text}; p=get_product(state["product_id"]); price=f"{p['price_rub']:,}".replace(","," "); await send(chat_id,f"🧾 <b>Проверьте заказ</b>\n\n💎 {esc(p['name'])}\n💰 {price} ₽\n👤 {esc(state['name'])}\n📞 {esc(text)}\n\nВсё верно?",order_confirm_kb()); return
     if t=="order_confirm":
         if text!="✅ Подтвердить заказ": user_states.pop(chat_id,None); await send(chat_id,"Заказ отменён.",main_kb()); return
@@ -766,26 +1178,30 @@ async def handle_state(chat_id, text, state, message):
         await send(chat_id, f"Статус заказа №{o['id']} изменён: {status_text(status)}", admin_kb())
         return
     if t=="admin_add_name":
-        user_states[chat_id]={"type":"admin_add_desc","name":text[:100]}; await send(chat_id,"Введите описание:",admin_back_kb()); return
+        user_states[chat_id]={"type":"admin_add_desc","name":text[:100]}; await send(chat_id,"Введите описание:",back_kb()); return
     if t=="admin_add_desc":
-        user_states[chat_id]={"type":"admin_add_price","name":state["name"],"description":text[:1000]}; await send(chat_id,"Введите цену в рублях:",admin_back_kb()); return
+        user_states[chat_id]={"type":"admin_add_price","name":state["name"],"description":text[:1000]}; await send(chat_id,"Введите цену в рублях:",back_kb()); return
     if t=="admin_add_price":
         try: price=int(text.replace(" ","")); assert 0<=price<=10000000
-        except Exception: await send(chat_id,"Введите целую цену от 0 до 10 000 000.",admin_back_kb()); return
+        except Exception: await send(chat_id,"Введите целую цену от 0 до 10 000 000.",back_kb()); return
         add_product(state["name"],state["description"],price); user_states.pop(chat_id,None); await send(chat_id,"✅ Товар добавлен.",admin_kb()); return
     if t=="admin_edit_image":
         value=text.strip()
         if value=="-": value=None
         elif not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}",value) or not (IMAGES_DIR/value).exists():
-            await send(chat_id,"Файл не найден в static/images.",admin_back_kb()); return
+            await send(chat_id,"Файл не найден в static/images.",back_kb()); return
         update_product_image(state["product_id"],value); add_admin_audit(chat_id,"product_image","product",state["product_id"],str(value)); user_states.pop(chat_id,None); await admin_product(chat_id,get_product(state["product_id"])); return
-
+    if t=="admin_edit_image":
+        value=text.strip()
+        if value=="-": value=None
+        elif not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}",value) or not (IMAGES_DIR/value).exists(): await send(chat_id,"Файл не найден.",back_kb()); return
+        update_product_image(state['product_id'],value); add_admin_audit(chat_id,"product_image","product",state['product_id'],str(value)); user_states.pop(chat_id,None); await admin_product(chat_id,get_product(state['product_id'])); return
     if t.startswith("admin_edit_"):
         field=t.replace("admin_edit_","")
         value=text
         if field=="price":
             try: value=int(text.replace(" ","")); assert 0<=value<=10000000
-            except Exception: await send(chat_id,"Введите корректную цену.",admin_back_kb()); return
+            except Exception: await send(chat_id,"Введите корректную цену.",back_kb()); return
         update_product(state["product_id"],{"name":"name","description":"description","price":"price_rub"}[field],value); user_states.pop(chat_id,None); await admin_catalog(chat_id); return
     if t=="admin_broadcast":
         if chat_id!=ADMIN_ID: user_states.pop(chat_id,None); return
@@ -878,16 +1294,9 @@ async def process_update(update):
     if state:
         await handle_state(chat_id, text, state, m)
         return
-    if text=="🔙 Админ-панель" and chat_id==ADMIN_ID:
-        await send(chat_id, "👑 <b>Админ-панель</b>", admin_kb())
-        return
     if text=="/admin" and chat_id==ADMIN_ID: await send(chat_id,f"👑 <b>Админ-панель</b>\n\nРежим доступа: <b>{BOT_ACCESS_MODE}</b>\nТестировщиков: <b>{len(ALLOWED_USER_IDS)}</b>",admin_kb()); return
     if text in {"🔙 Главное меню","🔙 Главнoe меню"}: await send(chat_id,"Главное меню:",main_kb()); return
-    if text=="🔮 Предсказание на день":
-        await send_photo(chat_id, "daily_forecast.png")
-        await ai_processing(chat_id,"daily")
-        await send(chat_id,f"🔮 <b>Предсказание на {datetime.now(MOSCOW_TZ):%d.%m.%Y}</b>\n\n{esc(get_random_daily_prediction() or get_random_prediction())}",main_kb())
-        return
+    if text=="🔮 Предсказание на день": await ai_processing(chat_id,"daily"); await send(chat_id,f"🔮 <b>Предсказание на {datetime.now(MOSCOW_TZ):%d.%m.%Y}</b>\n\n{esc(get_random_daily_prediction() or get_random_prediction())}",main_kb()); return
     if text=="✨ Персональное": await begin_personal(chat_id); return
     if text=="🎯 По сферам": await send(chat_id,"Выберите сферу:",sphere_kb()); return
     sm={"❤️ Любовь":"love","💼 Карьера":"career","💰 Финансы":"finance","👨‍👩‍👧 Семья":"family","🌿 Самочувствие":"health","📚 Развитие":"growth"}
@@ -898,7 +1307,6 @@ async def process_update(update):
         if get_magic8_remaining(chat_id)<=0: await send(chat_id,"🎱 Лимит из 3 вопросов на сегодня исчерпан.",main_kb()); return
         user_states[chat_id]={"type":"magic8_question"}; await send(chat_id,"Сформулируйте вопрос, на который возможен ответ «Да» или «Нет».",back_kb()); return
     if text=="🎁 Подарок другу":
-        await send_photo(chat_id, "gift.png")
         await send(chat_id,"🎁 <b>Подарок другу</b>\n\nВыберите подарок:",kb([[{"text":"🔮 Подарить предсказание"}],[{"text":"💎 Подарить браслет"}],[{"text":"🔙 Главное меню"}]])); return
     if text=="🔮 Подарить предсказание":
         user_states[chat_id]={"type":"gift_prediction_username"}; await send(chat_id,"🎁 <b>Подарить предсказание</b>\n\nВведите Telegram-логин получателя в формате <b>@username</b>.",back_kb()); return
@@ -944,7 +1352,6 @@ async def process_update(update):
         except Exception:
             await send(chat_id,"Не удалось открыть оценку заказа.",account_kb()); return
     if text=="📊 Мой день":
-        await send_photo(chat_id, "my_day.png")
         u=get_user(chat_id)
         if not u.get("birthdate"): await begin_personal(chat_id); return
         await ai_processing(chat_id,"personal")
@@ -1088,6 +1495,23 @@ async def startup(app_):
     if reset_all_user_data_once():
         print("USER DATA RESET COMPLETED")
     telegram_session = aiohttp.ClientSession()
+
+    if PUBLIC_URL:
+        try:
+            await telegram_request(
+                "setChatMenuButton",
+                {
+                    "menu_button": {
+                        "type": "web_app",
+                        "text": "🌌 Приложение",
+                        "web_app": {"url": f"{PUBLIC_URL}/app"},
+                    }
+                },
+            )
+            print("MINI APP MENU BUTTON CONFIGURED")
+        except Exception as exc:
+            print(f"MINI APP MENU BUTTON ERROR: {exc}")
+
     app_["leader"] = asyncio.create_task(bot_leader(app_))
 
 async def cleanup(app_):
