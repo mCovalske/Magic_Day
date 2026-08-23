@@ -1,4 +1,4 @@
-# BUILD: PREDBOT-2026-08-23-MINI-APP-02
+# BUILD: PREDBOT-2026-08-23-MINI-APP-RUNTIME-02
 import asyncio
 import html
 import os
@@ -362,6 +362,15 @@ def sanitize_user_for_web(user):
     }
 
 
+def sanitize_subscription_for_web(value):
+    if not value:
+        return {"time": "09:00", "active": False}
+    return {
+        "time": str(value.get("time") or "09:00"),
+        "active": bool(value.get("active")),
+    }
+
+
 def sanitize_order_for_web(order):
     if not order:
         return None
@@ -473,6 +482,131 @@ async def webapp_orders(request):
         except Exception as exc:
             print(f"WEB APP ADMIN NOTIFY ERROR: {exc}")
     return web.json_response({"order_id": oid})
+
+async def webapp_profile(request):
+    uid, _ = await webapp_user(request)
+    u = web_user_payload(uid)
+    if request.method == "GET":
+        return web.json_response({"user": u})
+    if request.method != "POST":
+        raise web.HTTPMethodNotAllowed(request.method, ["GET", "POST"])
+    body = await request.json()
+    name = (body.get("name") or "").strip()[:50]
+    gender = (body.get("gender") or "").strip()
+    birthdate = (body.get("birthdate") or "").strip()
+    phone = (body.get("phone") or "").strip()
+    if birthdate and not valid_date(birthdate):
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Неверная дата рождения"}), content_type="application/json")
+    if phone and not valid_phone(phone):
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Неверный номер телефона"}), content_type="application/json")
+    for field, value in [("name", name), ("gender", gender), ("birthdate", birthdate), ("phone", phone)]:
+        update_user_field(uid, field, value)
+    return web.json_response({"user": sanitize_user_for_web(web_user_payload(uid))})
+
+
+async def webapp_delete_profile(request):
+    uid, _ = await webapp_user(request)
+    delete_user_data(uid)
+    return web.json_response({"ok": True})
+
+
+async def webapp_subscription(request):
+    uid, _ = await webapp_user(request)
+    u = web_user_payload(uid)
+    if not u["consent_given"]:
+        raise web.HTTPForbidden(text=json.dumps({"error": "Сначала подтвердите согласие"}), content_type="application/json")
+    if request.method == "GET":
+        sub = get_subscription(uid) or {"time": "09:00", "active": False}
+        return web.json_response(sub)
+    body = await request.json()
+    time_local = str(body.get("time") or "09:00")
+    active = bool(body.get("active", True))
+    try:
+        datetime.strptime(time_local, "%H:%M")
+    except ValueError:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Неверное время"}), content_type="application/json")
+    set_subscription(uid, time_local, active)
+    return web.json_response(sanitize_subscription_for_web(get_subscription(uid)))
+
+
+async def webapp_forecast(request):
+    uid, _ = await webapp_user(request)
+    u = web_user_payload(uid)
+    if not u["consent_given"]:
+        raise web.HTTPForbidden(text=json.dumps({"error": "Сначала подтвердите согласие"}), content_type="application/json")
+    body = await request.json()
+    kind = request.match_info["kind"]
+
+    if kind == "daily":
+        forecast = get_random_daily_prediction() or get_random_prediction()
+        return web.json_response({"html": esc(forecast).replace("\n", "<br>")})
+
+    name = (body.get("name") or u["name"] or "").strip()[:50]
+    gender = (body.get("gender") or u["gender"] or "other").strip()
+    birthdate = (body.get("birthdate") or u["birthdate"] or "").strip()
+    sphere = body.get("sphere")
+
+    if not name:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Введите имя"}), content_type="application/json")
+    if not valid_date(birthdate):
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Дата рождения должна быть в формате ДД.ММ.ГГГГ"}), content_type="application/json")
+
+    update_user_field(uid, "name", name)
+    update_user_field(uid, "gender", gender)
+    update_user_field(uid, "birthdate", birthdate)
+
+    if sphere:
+        forecast = get_sphere_forecast(birthdate, gender, name, sphere)
+    else:
+        forecast = get_personal_forecast(birthdate, gender, name)
+
+    return web.json_response({"html": esc(forecast).replace("\n", "<br>"), "user": web_user_payload(uid)})
+
+
+async def webapp_my_day(request):
+    uid, _ = await webapp_user(request)
+    u = web_user_payload(uid)
+    if not u["consent_given"] or not u["birthdate"]:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Сначала заполните дату рождения"}), content_type="application/json")
+    text = get_personal_forecast(u["birthdate"], u["gender"] or "other", u["name"] or "Друг")
+    return web.json_response({"html": esc(text).replace("\n", "<br>")})
+
+
+async def webapp_magic8(request):
+    uid, _ = await webapp_user(request)
+    u = web_user_payload(uid)
+    if not u["consent_given"]:
+        raise web.HTTPForbidden(text=json.dumps({"error": "Сначала подтвердите согласие"}), content_type="application/json")
+    if request.method == "GET":
+        return web.json_response({"remaining": get_magic8_remaining(uid)})
+    body = await request.json()
+    q = (body.get("question") or "").strip()[:250]
+    if not q or is_bad(q):
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Сформулируйте короткий и уважительный вопрос"}), content_type="application/json")
+    ok, remaining = consume_magic8_question(uid)
+    if not ok:
+        raise web.HTTPTooManyRequests(text=json.dumps({"error": "Лимит в 3 вопроса на сегодня исчерпан"}), content_type="application/json")
+    return web.json_response({"answer": get_random_magic8_answer(), "remaining": remaining})
+
+
+async def webapp_gift_prediction(request):
+    uid, _ = await webapp_user(request)
+    u = web_user_payload(uid)
+    if not u["consent_given"]:
+        raise web.HTTPForbidden(text=json.dumps({"error": "Сначала подтвердите согласие"}), content_type="application/json")
+    body = await request.json()
+    username = (body.get("username") or "").strip()
+    if not username.startswith("@") or len(username) < 2:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Введите @username"}), content_type="application/json")
+    recipient = get_user_by_username(username)
+    if not recipient:
+        raise web.HTTPNotFound(text=json.dumps({"error": "Пользователь не найден среди тех, кто уже запускал бота"}), content_type="application/json")
+    if recipient["telegram_id"] == uid:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Нельзя отправить подарок самому себе"}), content_type="application/json")
+    text = get_random_daily_prediction() or get_random_prediction()
+    await send(recipient["telegram_id"], f"🎁 <b>Вам подарили предсказание!</b>\n\n{esc(text)}", main_kb())
+    return web.json_response({"ok": True})
+
 
 async def webapp_review(request):
     uid, _ = await webapp_user(request)
