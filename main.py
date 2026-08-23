@@ -1,4 +1,4 @@
-# BUILD: PREDBOT-2026-08-23-MINI-APP-RUNTIME-02
+# BUILD: PREDBOT-2026-08-23-SHARED-ACCOUNT-FIX-02
 import asyncio
 import html
 import os
@@ -401,7 +401,6 @@ def web_status_label(status):
 
 
 def web_user_payload(telegram_id):
-    ensure_user(telegram_id)
     u = get_user(telegram_id) or {
         "telegram_id": telegram_id, "name": "", "gender": "", "birthdate": "",
         "phone": "", "username": "", "consent_given": False, "consent_version": "",
@@ -428,6 +427,7 @@ async def webapp_auth(request):
 
 async def webapp_consent(request):
     uid, _ = await webapp_user(request)
+    ensure_user(uid)
     give_consent(uid)
     return web.json_response({"user": web_user_payload(uid)})
 
@@ -1000,7 +1000,11 @@ async def handle_state(chat_id, text, state, message):
 
     if t=="consent":
         if text=="✅ Ознакомился(лась) и даю согласие":
-            give_consent(chat_id); user_states.pop(chat_id,None); await send(chat_id,"✅ Спасибо. Согласие сохранено. Теперь доступен весь функционал.",main_kb()); return
+            ensure_user(chat_id)
+            give_consent(chat_id)
+            user_states.pop(chat_id,None)
+            await send(chat_id,"✅ Спасибо. Согласие сохранено. Теперь доступен весь функционал.",main_kb())
+            return
         if text=="❌ Не согласен(на)":
             await send(chat_id,"Без согласия бот не сможет сохранять ваши персональные данные и оформлять заказ.",consent_kb()); return
         await send(chat_id,"Выберите один из вариантов ниже.",consent_kb()); return
@@ -1311,14 +1315,19 @@ async def process_update(update):
                 pass
         return
     existed=get_user(chat_id)
-    ensure_user(chat_id)
-    u=get_user(chat_id)
-    if existed is None and chat_id != ADMIN_ID and get_admin_settings()["new_user"]:
-        try:
-            await send(ADMIN_ID, f"👤 <b>Новый пользователь</b>\n\n🆔 {chat_id}", admin_kb())
-            add_admin_audit(ADMIN_ID, "new_user", "user", chat_id, "")
-        except Exception:
-            pass
+    u=existed or {
+        "telegram_id": chat_id,
+        "name": "",
+        "gender": "",
+        "birthdate": "",
+        "phone": "",
+        "username": uname,
+        "consent_given": False,
+        "consent_version": "",
+    }
+
+    # Не создаём удалённый профиль автоматически.
+    # После удаления пользователь сможет вернуться только после явного согласия.
     state=user_states.get(chat_id)
 
     # /start is always a safe reset command once consent has been granted.
@@ -1327,12 +1336,18 @@ async def process_update(update):
         await send(chat_id, "🔮 <b>С возвращением!</b>\n\nВыберите действие:", main_kb())
         return
 
+    if not u.get("consent_given") and text == "/start":
+        user_states[chat_id] = {"type": "consent"}
+        await welcome(chat_id)
+        return
+
     # Consent is the source of truth. If the published consent version changes,
     # the user must see the documents and explicitly confirm the new version.
     consent_ok = bool(u.get("consent_given")) and u.get("consent_version") == CONSENT_VERSION
 
     if not consent_ok:
         if text == "✅ Ознакомился(лась) и даю согласие":
+            ensure_user(chat_id)
             give_consent(chat_id)
             user_states.pop(chat_id, None)
             await send(
