@@ -1,4 +1,4 @@
-# BUILD: PREDBOT-2026-08-23-MINI-APP-01
+# BUILD: PREDBOT-2026-08-23-MINI-APP-02
 import asyncio
 import html
 import os
@@ -669,8 +669,10 @@ async def webapp_admin_audit(request):
 
 
 async def homepage(request):
-    f=STATIC_DIR/"index.html"
-    return web.FileResponse(f) if f.exists() else web.Response(text="OK")
+    # The root URL must no longer expose the legacy landing page.
+    # It now serves the Telegram Mini App as well, so stale Telegram menu URLs
+    # cannot accidentally open the old date/prediction page.
+    return await webapp_index(request)
 async def health(request): return web.json_response({"status":"ok","build":"PREDBOT-2026-08-23-MINI-APP-01"})
 app.router.add_get("/",homepage); app.router.add_get("/health",health); app.router.add_static("/static",path=str(STATIC_DIR),name="static"); app.router.add_static("/legal",path=str(LEGAL_DIR),name="legal")
 app.router.add_get("/app", webapp_index)
