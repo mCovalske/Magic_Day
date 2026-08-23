@@ -1,4 +1,4 @@
-# BUILD: PREDBOT-2026-08-20-ADMIN-NAV-03
+# BUILD: PREDBOT-2026-08-23-MYSTICAL-STYLE-01
 import asyncio
 import html
 import os
@@ -219,7 +219,7 @@ async def ai_processing(chat_id, kind="daily"):
         await asyncio.sleep(0.65)
 
 async def welcome(chat_id):
-    await send_photo(chat_id, "welcome.png")
+    await send_photo(chat_id, "welcome_hero.png")
     links = []
     if PUBLIC_URL:
         links = [
@@ -287,6 +287,7 @@ def legal_url(filename):
     return f"{base}/legal/{filename}"
 
 async def show_legal_documents(chat_id):
+    await send_photo(chat_id, "legal.png")
     if not PUBLIC_URL:
         await send(
             chat_id,
@@ -307,6 +308,7 @@ async def show_legal_documents(chat_id):
 async def ensure_profile(chat_id): ensure_user(chat_id); return get_user(chat_id)
 
 async def begin_personal(chat_id,sphere=None):
+    await send_photo(chat_id, "spheres.png" if sphere else "personal_forecast.png")
     u=await ensure_profile(chat_id)
     if not u["name"]: user_states[chat_id]={"type":"personal_name","sphere":sphere}; await send(chat_id,"Как вас зовут?",back_kb()); return
     if not u["gender"]: user_states[chat_id]={"type":"personal_gender","sphere":sphere}; await send(chat_id,"Укажите ваш пол — это помогает сформировать обращение.",gender_kb()); return
@@ -319,6 +321,7 @@ async def produce_forecast(chat_id,u,sphere=None):
     await send(chat_id,text,main_kb())
 
 async def show_catalog(chat_id):
+    await send_photo(chat_id, "catalog.png")
     if not get_products(True): await send(chat_id,"Каталог временно пуст.",main_kb()); return
     await send(chat_id,"💎 <b>Каталог</b>\n\nВыберите бусину Дзи:",catalog_kb())
 
@@ -328,6 +331,7 @@ async def show_product(chat_id,p):
     await send(chat_id,f"💎 <b>{esc(p['name'])}</b>\n\n{esc(p['description'])}\n\n💰 <b>{price} ₽</b>",product_kb())
 
 async def show_account(chat_id):
+    await send_photo(chat_id, "profile.png")
     u=await ensure_profile(chat_id); orders=get_user_orders(chat_id)
     g={"male":"мужчина","female":"женщина","other":"не указано"}.get(u["gender"],"не указано")
     await send(chat_id,f"👤 <b>Личный кабинет</b>\n\nИмя: <b>{esc(u['name'] or 'не указано')}</b>\nПол: <b>{g}</b>\nДата рождения: <b>{esc(u['birthdate'] or 'не указана')}</b>\nТелефон: <b>{esc(u['phone'] or 'не указан')}</b>\nЗаказов: <b>{len(orders)}</b>",account_kb())
@@ -359,6 +363,7 @@ async def show_orders(chat_id):
         await send(chat_id, "\n".join(parts), account_kb())
 
 async def show_notifications(chat_id):
+    await send_photo(chat_id, "notifications.png")
     sub=get_subscription(chat_id)
     if sub and sub["active"]:
         await send(chat_id,f"🔔 <b>Уведомления включены</b>\n\nКаждый день в <b>{sub['time']}</b> по Москве я сообщу, что ваше предсказание на день готово.",notifications_kb(True))
@@ -878,7 +883,11 @@ async def process_update(update):
         return
     if text=="/admin" and chat_id==ADMIN_ID: await send(chat_id,f"👑 <b>Админ-панель</b>\n\nРежим доступа: <b>{BOT_ACCESS_MODE}</b>\nТестировщиков: <b>{len(ALLOWED_USER_IDS)}</b>",admin_kb()); return
     if text in {"🔙 Главное меню","🔙 Главнoe меню"}: await send(chat_id,"Главное меню:",main_kb()); return
-    if text=="🔮 Предсказание на день": await ai_processing(chat_id,"daily"); await send(chat_id,f"🔮 <b>Предсказание на {datetime.now(MOSCOW_TZ):%d.%m.%Y}</b>\n\n{esc(get_random_daily_prediction() or get_random_prediction())}",main_kb()); return
+    if text=="🔮 Предсказание на день":
+        await send_photo(chat_id, "daily_forecast.png")
+        await ai_processing(chat_id,"daily")
+        await send(chat_id,f"🔮 <b>Предсказание на {datetime.now(MOSCOW_TZ):%d.%m.%Y}</b>\n\n{esc(get_random_daily_prediction() or get_random_prediction())}",main_kb())
+        return
     if text=="✨ Персональное": await begin_personal(chat_id); return
     if text=="🎯 По сферам": await send(chat_id,"Выберите сферу:",sphere_kb()); return
     sm={"❤️ Любовь":"love","💼 Карьера":"career","💰 Финансы":"finance","👨‍👩‍👧 Семья":"family","🌿 Самочувствие":"health","📚 Развитие":"growth"}
@@ -889,6 +898,7 @@ async def process_update(update):
         if get_magic8_remaining(chat_id)<=0: await send(chat_id,"🎱 Лимит из 3 вопросов на сегодня исчерпан.",main_kb()); return
         user_states[chat_id]={"type":"magic8_question"}; await send(chat_id,"Сформулируйте вопрос, на который возможен ответ «Да» или «Нет».",back_kb()); return
     if text=="🎁 Подарок другу":
+        await send_photo(chat_id, "gift.png")
         await send(chat_id,"🎁 <b>Подарок другу</b>\n\nВыберите подарок:",kb([[{"text":"🔮 Подарить предсказание"}],[{"text":"💎 Подарить браслет"}],[{"text":"🔙 Главное меню"}]])); return
     if text=="🔮 Подарить предсказание":
         user_states[chat_id]={"type":"gift_prediction_username"}; await send(chat_id,"🎁 <b>Подарить предсказание</b>\n\nВведите Telegram-логин получателя в формате <b>@username</b>.",back_kb()); return
@@ -934,6 +944,7 @@ async def process_update(update):
         except Exception:
             await send(chat_id,"Не удалось открыть оценку заказа.",account_kb()); return
     if text=="📊 Мой день":
+        await send_photo(chat_id, "my_day.png")
         u=get_user(chat_id)
         if not u.get("birthdate"): await begin_personal(chat_id); return
         await ai_processing(chat_id,"personal")
