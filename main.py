@@ -65,7 +65,20 @@ if not BOT_TOKEN:
 if ADMIN_ID <= 0:
     raise RuntimeError("ADMIN_ID must be set")
 
-app = web.Application()
+@web.middleware
+async def webapp_error_middleware(request, handler):
+    try:
+        return await handler(request)
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        print(f"WEB APP ERROR {request.method} {request.path}: {exc}")
+        if request.path.startswith("/api/webapp/"):
+            return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
+        raise
+
+
+app = web.Application(middlewares=[webapp_error_middleware])
 user_states = {}
 user_activity = {}
 last_notification_sent = {}
@@ -328,6 +341,44 @@ async def webapp_user(request):
     return validate_webapp_init_data(raw)
 
 
+def web_json_value(value):
+    return value.isoformat() if hasattr(value, "isoformat") else value
+
+
+def sanitize_user_for_web(user):
+    if not user:
+        return {}
+    return {
+        "telegram_id": int(user.get("telegram_id") or 0),
+        "name": user.get("name") or "",
+        "gender": user.get("gender") or "",
+        "birthdate": user.get("birthdate") or "",
+        "phone": user.get("phone") or "",
+        "username": user.get("username") or "",
+        "consent_given": bool(user.get("consent_given")),
+        "consent_version": user.get("consent_version") or "",
+        "consent_at": web_json_value(user.get("consent_at")),
+        "created_at": web_json_value(user.get("created_at")),
+    }
+
+
+def sanitize_order_for_web(order):
+    if not order:
+        return None
+    return {
+        "id": int(order.get("id") or 0),
+        "telegram_id": int(order.get("telegram_id") or 0),
+        "product_id": int(order["product_id"]) if order.get("product_id") is not None else None,
+        "product_name": order.get("product_name") or "",
+        "customer_name": order.get("customer_name") or "",
+        "customer_phone": order.get("customer_phone") or "",
+        "status": order.get("status") or "",
+        "status_label": web_status_label(order.get("status") or ""),
+        "created_at": web_json_value(order.get("created_at")),
+        "updated_at": web_json_value(order.get("updated_at")),
+    }
+
+
 def web_status_label(status):
     return {
         "new": "🆕 Новый",
@@ -346,12 +397,7 @@ def web_user_payload(telegram_id):
         "telegram_id": telegram_id, "name": "", "gender": "", "birthdate": "",
         "phone": "", "username": "", "consent_given": False, "consent_version": "",
     }
-    out = dict(u)
-    for key in ("created_at", "consent_at"):
-        if hasattr(out.get(key), "isoformat"):
-            out[key] = out[key].isoformat()
-    return out
-
+    return sanitize_user_for_web(u)
 
 async def webapp_index(request):
     f = WEBAPP_DIR / "index.html"
@@ -401,157 +447,32 @@ async def webapp_orders(request):
     u = web_user_payload(uid)
     if not u["consent_given"]:
         raise web.HTTPForbidden(text=json.dumps({"error": "Сначала подтвердите согласие"}), content_type="application/json")
+
     if request.method == "GET":
-        rows = get_user_orders(uid)
-        for row in rows:
-            row["status_label"] = web_status_label(row["status"])
-            if hasattr(row.get("created_at"), "isoformat"):
-                row["created_at"] = row["created_at"].isoformat()
-        return web.json_response({"orders": rows})
+        return web.json_response({"orders": [sanitize_order_for_web(x) for x in get_user_orders(uid)]})
 
     body = await request.json()
-    product_id = int(body.get("product_id", 0))
+    try:
+        product_id = int(body.get("product_id", 0))
+    except (TypeError, ValueError):
+        product_id = 0
     name = (body.get("name") or "").strip()[:50]
     phone = (body.get("phone") or "").strip()
-    if not name or not valid_phone(phone):
-        raise web.HTTPBadRequest(text=json.dumps({"error": "Проверьте имя и номер телефона"}), content_type="application/json")
+    if not product_id or not name or not valid_phone(phone):
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Проверьте товар, имя и номер телефона"}), content_type="application/json")
+    product = get_product(product_id)
+    if not product or not product["is_active"]:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Товар недоступен"}), content_type="application/json")
     oid = create_order(uid, product_id, name, phone)
     update_user_field(uid, "name", name)
     update_user_field(uid, "phone", phone)
     if ADMIN_ID:
         try:
-            p = get_product(product_id)
-            await send(ADMIN_ID, f"🆕 <b>Новый заказ №{oid}</b>\n\n💎 {esc(p['name'])}\n👤 {esc(name)}\n📞 {esc(phone)}\n🆔 {uid}", admin_kb())
+            await send(ADMIN_ID, f"🆕 <b>Новый заказ №{oid}</b>\n\n💎 {esc(product['name'])}\n👤 {esc(name)}\n📞 {esc(phone)}\n🆔 {uid}", admin_kb())
             add_admin_audit(ADMIN_ID, "web_order", "order", oid, f"user={uid}")
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"WEB APP ADMIN NOTIFY ERROR: {exc}")
     return web.json_response({"order_id": oid})
-
-
-async def webapp_profile(request):
-    uid, _ = await webapp_user(request)
-    u = web_user_payload(uid)
-    if request.method == "GET":
-        return web.json_response({"user": u})
-    if request.method != "POST":
-        raise web.HTTPMethodNotAllowed(request.method, ["GET", "POST"])
-    body = await request.json()
-    name = (body.get("name") or "").strip()[:50]
-    gender = (body.get("gender") or "").strip()
-    birthdate = (body.get("birthdate") or "").strip()
-    phone = (body.get("phone") or "").strip()
-    if birthdate and not valid_date(birthdate):
-        raise web.HTTPBadRequest(text=json.dumps({"error": "Неверная дата рождения"}), content_type="application/json")
-    if phone and not valid_phone(phone):
-        raise web.HTTPBadRequest(text=json.dumps({"error": "Неверный номер телефона"}), content_type="application/json")
-    for field, value in [("name", name), ("gender", gender), ("birthdate", birthdate), ("phone", phone)]:
-        update_user_field(uid, field, value)
-    return web.json_response({"user": web_user_payload(uid)})
-
-
-async def webapp_delete_profile(request):
-    uid, _ = await webapp_user(request)
-    delete_user_data(uid)
-    return web.json_response({"ok": True})
-
-
-async def webapp_subscription(request):
-    uid, _ = await webapp_user(request)
-    u = web_user_payload(uid)
-    if not u["consent_given"]:
-        raise web.HTTPForbidden(text=json.dumps({"error": "Сначала подтвердите согласие"}), content_type="application/json")
-    if request.method == "GET":
-        sub = get_subscription(uid) or {"time": "09:00", "active": False}
-        return web.json_response(sub)
-    body = await request.json()
-    time_local = str(body.get("time") or "09:00")
-    active = bool(body.get("active", True))
-    try:
-        datetime.strptime(time_local, "%H:%M")
-    except ValueError:
-        raise web.HTTPBadRequest(text=json.dumps({"error": "Неверное время"}), content_type="application/json")
-    set_subscription(uid, time_local, active)
-    return web.json_response(get_subscription(uid))
-
-
-async def webapp_forecast(request):
-    uid, _ = await webapp_user(request)
-    u = web_user_payload(uid)
-    if not u["consent_given"]:
-        raise web.HTTPForbidden(text=json.dumps({"error": "Сначала подтвердите согласие"}), content_type="application/json")
-    body = await request.json()
-    kind = request.match_info["kind"]
-
-    if kind == "daily":
-        forecast = get_random_daily_prediction() or get_random_prediction()
-        return web.json_response({"html": esc(forecast).replace("\n", "<br>")})
-
-    name = (body.get("name") or u["name"] or "").strip()[:50]
-    gender = (body.get("gender") or u["gender"] or "other").strip()
-    birthdate = (body.get("birthdate") or u["birthdate"] or "").strip()
-    sphere = body.get("sphere")
-
-    if not name:
-        raise web.HTTPBadRequest(text=json.dumps({"error": "Введите имя"}), content_type="application/json")
-    if not valid_date(birthdate):
-        raise web.HTTPBadRequest(text=json.dumps({"error": "Дата рождения должна быть в формате ДД.ММ.ГГГГ"}), content_type="application/json")
-
-    update_user_field(uid, "name", name)
-    update_user_field(uid, "gender", gender)
-    update_user_field(uid, "birthdate", birthdate)
-
-    if sphere:
-        forecast = get_sphere_forecast(birthdate, gender, name, sphere)
-    else:
-        forecast = get_personal_forecast(birthdate, gender, name)
-
-    return web.json_response({"html": esc(forecast).replace("\n", "<br>"), "user": web_user_payload(uid)})
-
-
-async def webapp_my_day(request):
-    uid, _ = await webapp_user(request)
-    u = web_user_payload(uid)
-    if not u["consent_given"] or not u["birthdate"]:
-        raise web.HTTPBadRequest(text=json.dumps({"error": "Сначала заполните дату рождения"}), content_type="application/json")
-    text = get_personal_forecast(u["birthdate"], u["gender"] or "other", u["name"] or "Друг")
-    return web.json_response({"html": esc(text).replace("\n", "<br>")})
-
-
-async def webapp_magic8(request):
-    uid, _ = await webapp_user(request)
-    u = web_user_payload(uid)
-    if not u["consent_given"]:
-        raise web.HTTPForbidden(text=json.dumps({"error": "Сначала подтвердите согласие"}), content_type="application/json")
-    if request.method == "GET":
-        return web.json_response({"remaining": get_magic8_remaining(uid)})
-    body = await request.json()
-    q = (body.get("question") or "").strip()[:250]
-    if not q or is_bad(q):
-        raise web.HTTPBadRequest(text=json.dumps({"error": "Сформулируйте короткий и уважительный вопрос"}), content_type="application/json")
-    ok, remaining = consume_magic8_question(uid)
-    if not ok:
-        raise web.HTTPTooManyRequests(text=json.dumps({"error": "Лимит в 3 вопроса на сегодня исчерпан"}), content_type="application/json")
-    return web.json_response({"answer": get_random_magic8_answer(), "remaining": remaining})
-
-
-async def webapp_gift_prediction(request):
-    uid, _ = await webapp_user(request)
-    u = web_user_payload(uid)
-    if not u["consent_given"]:
-        raise web.HTTPForbidden(text=json.dumps({"error": "Сначала подтвердите согласие"}), content_type="application/json")
-    body = await request.json()
-    username = (body.get("username") or "").strip()
-    if not username.startswith("@") or len(username) < 2:
-        raise web.HTTPBadRequest(text=json.dumps({"error": "Введите @username"}), content_type="application/json")
-    recipient = get_user_by_username(username)
-    if not recipient:
-        raise web.HTTPNotFound(text=json.dumps({"error": "Пользователь не найден среди тех, кто уже запускал бота"}), content_type="application/json")
-    if recipient["telegram_id"] == uid:
-        raise web.HTTPBadRequest(text=json.dumps({"error": "Нельзя отправить подарок самому себе"}), content_type="application/json")
-    text = get_random_daily_prediction() or get_random_prediction()
-    await send(recipient["telegram_id"], f"🎁 <b>Вам подарили предсказание!</b>\n\n{esc(text)}", main_kb())
-    return web.json_response({"ok": True})
-
 
 async def webapp_review(request):
     uid, _ = await webapp_user(request)
@@ -574,28 +495,34 @@ async def webapp_review(request):
 async def webapp_legal(request):
     await webapp_user(request)
     docs = get_legal_documents()
-    fallback = {
-        "policy_personal_data": "01_policy_personal_data.html",
-        "consent_personal_data": "02_consent_personal_data.html",
-        "confidentiality_security": "03_confidentiality_security.html",
-        "user_agreement": "04_user_agreement.html",
-        "public_offer": "05_public_offer.html",
-        "disclaimer_predictions": "06_disclaimer_predictions.html",
-        "marketing_consent": "07_marketing_consent.html",
-        "data_subject_requests": "08_data_subject_requests.html",
+    mapping = {
+        "policy": ("01_policy_personal_data.html", "Политика ПДн"),
+        "consent": ("02_consent_personal_data.html", "Согласие ПДн"),
+        "confidentiality": ("03_confidentiality_security.html", "Конфиденциальность"),
+        "agreement": ("04_user_agreement.html", "Пользовательское соглашение"),
+        "offer": ("05_public_offer.html", "Публичная оферта"),
+        "disclaimer": ("06_disclaimer_predictions.html", "Дисклеймер"),
+        "marketing": ("07_marketing_consent.html", "Рекламное согласие"),
+        "rights": ("08_data_subject_requests.html", "Права субъекта ПДн"),
     }
-    result = []
-    for d in docs:
-        file_name = fallback.get(d.get("key", ""), "")
-        url = d.get("url") or (f"{PUBLIC_URL}/legal/{file_name}" if PUBLIC_URL and file_name else "")
-        result.append({"title": d.get("title") or "Документ", "url": url, "version": d.get("version") or ""})
+    result=[]
+    for doc in docs:
+        file_name, fallback_title = mapping.get(doc.get("key", ""), ("", doc.get("title") or "Документ"))
+        if not file_name:
+            continue
+        result.append({
+            "title": fallback_title,
+            "file": file_name,
+            "url": f"{PUBLIC_URL}/legal/{file_name}" if PUBLIC_URL else f"/legal/{file_name}",
+            "version": doc.get("version") or "",
+        })
     if not result:
-        for key, file_name in fallback.items():
-            result.append({"title": key, "url": f"{PUBLIC_URL}/legal/{file_name}" if PUBLIC_URL else "", "version": ""})
+        result=[
+            {"title": title, "file": file_name, "url": f"{PUBLIC_URL}/legal/{file_name}" if PUBLIC_URL else f"/legal/{file_name}", "version": ""}
+            for file_name,title in mapping.values()
+        ]
     return web.json_response({"documents": result})
 
-
-# ----- Admin -----
 def require_admin(uid):
     if uid != ADMIN_ID:
         raise web.HTTPForbidden(text=json.dumps({"error": "Недостаточно прав"}), content_type="application/json")
@@ -609,26 +536,28 @@ async def webapp_admin_analytics(request):
 
 
 async def webapp_admin_orders(request):
-    uid, _ = await webapp_user(request); require_admin(uid)
+    uid, _ = await webapp_user(request)
+    require_admin(uid)
     if request.method == "GET":
-        rows = get_recent_orders(100)
-        for row in rows:
-            if hasattr(row.get("created_at"), "isoformat"):
-                row["created_at"] = row["created_at"].isoformat()
-        return web.json_response({"orders": rows})
-    oid = int(request.match_info["order_id"])
-    body = await request.json()
-    status = str(body.get("status") or "")
-    set_order_status(oid, status)
-    add_admin_audit(uid, "web_order_status", "order", oid, status)
-    order = get_order(oid)
+        return web.json_response({"orders": [sanitize_order_for_web(x) for x in get_recent_orders(100)]})
+    try:
+        oid=int(request.match_info["order_id"])
+    except (TypeError,ValueError):
+        raise web.HTTPBadRequest(text=json.dumps({"error":"Некорректный номер заказа"}), content_type="application/json")
+    body=await request.json()
+    status=str(body.get("status") or "")
+    try:
+        set_order_status(oid,status)
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text=json.dumps({"error":str(exc)}), content_type="application/json")
+    add_admin_audit(uid,"web_order_status","order",oid,status)
+    order=get_order(oid)
     if order:
         try:
-            await send(order["telegram_id"], f"{web_status_label(status)} Заказ №{oid}.", main_kb())
-        except Exception:
-            pass
-    return web.json_response({"ok": True})
-
+            await send(order["telegram_id"],f"{web_status_label(status)} Заказ №{oid}.",main_kb())
+        except Exception as exc:
+            print(f"WEB APP STATUS NOTIFY ERROR: {exc}")
+    return web.json_response({"ok":True})
 
 async def webapp_admin_users(request):
     uid, _ = await webapp_user(request); require_admin(uid)
