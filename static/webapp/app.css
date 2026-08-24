@@ -81,3 +81,32 @@ button,input,textarea,select{font:inherit} button{cursor:pointer}
 @keyframes answerReveal{0%{opacity:0;transform:scale(.96);filter:blur(4px)}60%{opacity:1;transform:scale(1.015);filter:blur(0)}100%{transform:scale(1)}}
 @keyframes answerGlow{from{box-shadow:0 16px 45px rgba(0,0,0,.35)}to{box-shadow:0 18px 50px rgba(141,99,230,.18),0 0 28px rgba(232,189,99,.08)}}
 @keyframes pulseOnce{0%{transform:scale(1)}40%{transform:scale(1.025)}100%{transform:scale(1)}}
+
+/* ===== VISIBLE MYSTICAL MOTION V2 ===== */
+.app-shell::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:-1;background:
+ radial-gradient(circle at 18% 18%,rgba(154,102,255,.18),transparent 28%),
+ radial-gradient(circle at 82% 24%,rgba(255,211,119,.12),transparent 22%),
+ radial-gradient(circle at 52% 85%,rgba(99,62,196,.18),transparent 30%);
+ animation:nebulaMove 12s ease-in-out infinite alternate}
+.app-shell::after{content:"✦  ·  ✧  ·  ✦  ·  ⋆  ·  ✧  ·  ✦";position:fixed;inset:0;pointer-events:none;z-index:-1;color:rgba(255,229,171,.42);font-size:18px;letter-spacing:34px;line-height:92px;text-align:center;white-space:normal;overflow:hidden;animation:starField 28s linear infinite}
+.hero{position:relative}
+.hero::before{content:"";position:absolute;inset:-20%;background:conic-gradient(from 0deg,transparent 0 70%,rgba(255,220,150,.10) 78%,transparent 88%);mix-blend-mode:screen;animation:heroHalo 9s linear infinite;pointer-events:none;z-index:1}
+.hero img{transition:transform 1.2s cubic-bezier(.22,1,.36,1),filter 1.2s ease}
+.hero:hover img{transform:scale(1.07);filter:saturate(1.15) brightness(1.06)}
+.card{opacity:0;animation:cardReveal .65s cubic-bezier(.22,1,.36,1) forwards}
+.grid .card:nth-child(1){animation-delay:.04s}.grid .card:nth-child(2){animation-delay:.09s}.grid .card:nth-child(3){animation-delay:.14s}.grid .card:nth-child(4){animation-delay:.19s}.grid .card:nth-child(5){animation-delay:.24s}.grid .card:nth-child(6){animation-delay:.29s}.grid .card:nth-child(7){animation-delay:.34s}.grid .card:nth-child(8){animation-delay:.39s}.grid .card:nth-child(9){animation-delay:.44s}.grid .card:nth-child(10){animation-delay:.49s}
+.card::after{content:"";position:absolute;inset:0;border-radius:18px;background:linear-gradient(110deg,transparent 35%,rgba(255,240,194,.12) 50%,transparent 65%);transform:translateX(-130%);pointer-events:none}.card:hover::after{animation:cardShine .85s ease}.card:hover{transform:translateY(-4px) scale(1.012);box-shadow:0 18px 55px rgba(104,67,198,.26),0 0 26px rgba(232,189,99,.08)}
+.btn.gold{position:relative;overflow:hidden}.btn.gold::after{content:"";position:absolute;top:-40%;bottom:-40%;width:42%;left:-55%;background:linear-gradient(100deg,transparent,rgba(255,248,215,.45),transparent);transform:skewX(-20deg);animation:buttonSheen 3.8s ease-in-out infinite}
+.brand-mark{position:relative}.brand-mark::after{content:"";position:absolute;inset:-7px;border:1px solid rgba(232,189,99,.20);border-radius:50%;animation:ringPulse 3.6s ease-out infinite}
+.motion-step{animation:stepIn .5s cubic-bezier(.22,1,.36,1) forwards}
+.magic-orb{box-shadow:0 0 0 rgba(141,99,230,0);animation:magicPulse 2.8s ease-in-out infinite}
+.answer-reveal{animation:answerReveal .7s cubic-bezier(.22,1,.36,1) both,answerGlow 2.2s ease-in-out .7s infinite alternate}
+@keyframes nebulaMove{from{transform:scale(1) translate3d(-1%,-1%,0);filter:hue-rotate(0deg)}to{transform:scale(1.07) translate3d(1%,1%,0);filter:hue-rotate(10deg)}}
+@keyframes starField{from{transform:translate3d(0,-2%,0) rotate(0deg)}to{transform:translate3d(0,3%,0) rotate(1deg)}}
+@keyframes heroHalo{from{transform:rotate(0deg) scale(1)}to{transform:rotate(360deg) scale(1.06)}}
+@keyframes cardReveal{from{opacity:0;transform:translateY(18px) scale(.975);filter:blur(3px)}to{opacity:1;transform:none;filter:none}}
+@keyframes cardShine{to{transform:translateX(130%)}}
+@keyframes buttonSheen{0%,62%{left:-55%}78%,100%{left:125%}}
+@keyframes ringPulse{0%{transform:scale(.9);opacity:.7}70%,100%{transform:scale(1.35);opacity:0}}
+@keyframes magicPulse{0%,100%{box-shadow:0 0 0 rgba(141,99,230,0),0 0 0 rgba(232,189,99,0)}50%{box-shadow:0 0 30px rgba(141,99,230,.18),0 0 12px rgba(232,189,99,.10)}}
+@media (prefers-reduced-motion:reduce){.app-shell::before,.app-shell::after,.hero::before,.hero img,.card,.btn.gold::after,.brand-mark::after,.magic-orb,.answer-reveal{animation:none!important;transition:none!important}.card{opacity:1}}
